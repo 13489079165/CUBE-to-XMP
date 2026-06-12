@@ -4,13 +4,15 @@ import struct
 import zlib
 import hashlib
 import time
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
 # Configure global customtkinter settings
-ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
-ctk.set_default_color_theme("dark-blue")  # We'll switch away from standard blue, "dark-blue" is more muted, or we can use custom colors in widgets
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("dark-blue")
 
 kEncodeTable = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?`'|()[]{}@%$#"
 
@@ -20,26 +22,22 @@ def parse_xmp(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
         
-    # Extract title
     title = "Extracted_LUT"
     title_match = re.search(r'<crs:Name>\s*<rdf:Alt>\s*<rdf:li xml:lang="x-default">(.*?)</rdf:li>', content, re.DOTALL)
     if title_match:
         title = title_match.group(1).strip()
         
-    # Find the table block
     table_match = re.search(r'crs:Table_[A-F0-9]+="([^"]+)"', content)
     if not table_match:
         raise ValueError("Valid RGBTable data not found in XMP.")
         
     encoded_str = table_match.group(1)
     
-    # Decode Base85
     kDecodeTable = {}
     for i, c in enumerate(kEncodeTable):
         kDecodeTable[c] = i
         
     compressed_data = bytearray()
-    
     val = 0
     phase = 0
     
@@ -47,7 +45,6 @@ def parse_xmp(file_path):
         if c not in kDecodeTable:
             continue
         d = kDecodeTable[c]
-        
         phase += 1
         if phase == 1: val = d
         elif phase == 2: val += d * 85
@@ -58,7 +55,6 @@ def parse_xmp(file_path):
             compressed_data.extend(struct.pack('<I', val))
             phase = 0
             
-    # Handle remainder if any (though usually padded)
     if phase > 0:
         if phase == 2: compressed_data.extend(struct.pack('<B', val & 0xFF))
         elif phase == 3: compressed_data.extend(struct.pack('<H', val & 0xFFFF))
@@ -73,14 +69,8 @@ def parse_xmp(file_path):
     try:
         block_data = zlib.decompress(z_data)
     except zlib.error:
-        # Some padding issues might occur, try to decompress with larger buffer or ignore trailing garbage
         block_data = zlib.decompress(z_data, bufsize=uncompressed_size)
         
-    if len(block_data) != uncompressed_size:
-        pass # Not critical if it decompressed
-        
-    # Parse header
-    # header[4] = { version, version, dimensions, size }
     if len(block_data) < 16:
         raise ValueError("Invalid uncompressed data block")
         
@@ -90,15 +80,7 @@ def parse_xmp(file_path):
         raise ValueError(f"Only 3D LUTs are supported (found {dims}D)")
         
     nopValue = [(i * 0xFFFF + (size // 2)) // (size - 1) for i in range(size)]
-    
     samples = []
-    
-    # Read samples
-    # CUBE format requires: r changes fastest, then g, then b
-    # XMP packed it as: b changes fastest, then g, then r
-    
-    # We will read it into a 3D array first
-    # [r][g][b]
     lut_3d = [[[ (0,0,0) for _ in range(size)] for _ in range(size)] for _ in range(size)]
     
     offset = 16
@@ -109,15 +91,11 @@ def parse_xmp(file_path):
                     break
                 temp_r, temp_g, temp_b = struct.unpack('<HHH', block_data[offset:offset+6])
                 offset += 6
-                
-                # Reverse the nopValue adjustment
                 r_val = (temp_r + nopValue[r]) / 65535.0
                 g_val = (temp_g + nopValue[g]) / 65535.0
                 b_val = (temp_b + nopValue[b]) / 65535.0
-                
                 lut_3d[r][g][b] = (r_val, g_val, b_val)
                 
-    # Flatten it in CUBE order: R fast, G, B slow
     for b in range(size):
         for g in range(size):
             for r in range(size):
@@ -132,16 +110,14 @@ def build_cube(title, size, samples):
     lines.append('DOMAIN_MIN 0.0 0.0 0.0')
     lines.append('DOMAIN_MAX 1.0 1.0 1.0')
     lines.append('')
-    
     for r, g, b in samples:
         lines.append(f"{r:.6f} {g:.6f} {b:.6f}")
-        
+    return '\n'.join(lines)
+
 def encode_zlib_base85(data: bytes) -> str:
     padded_data = data + b'\x00\x00\x00'
     encoded_chars = []
-    
     compressed_size = len(data)
-    
     for i in range(0, len(data), 4):
         x = struct.unpack('<I', padded_data[i:i+4])[0]
         for j in range(5):
@@ -157,7 +133,6 @@ def parse_cube(file_path):
     size = None
     title = "My LUT"
     samples = []
-    
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -172,7 +147,6 @@ def parse_cube(file_path):
             elif line.startswith('DOMAIN_'):
                 continue
             else:
-                # assume it's data
                 parts = line.split()
                 if len(parts) >= 3:
                     try:
@@ -185,25 +159,20 @@ def parse_cube(file_path):
 def interpolate_3d(samples, size, new_size=32):
     new_samples = []
     ratio = (size - 1.0) / (new_size - 1.0)
-    
     def get_sample(r, g, b):
         r = max(0, min(size - 1, r))
         g = max(0, min(size - 1, g))
         b = max(0, min(size - 1, b))
         return samples[r + g * size + b * size * size]
-
     for b_idx in range(new_size):
         for g_idx in range(new_size):
             for r_idx in range(new_size):
                 r_pos = r_idx * ratio
                 g_pos = g_idx * ratio
                 b_pos = b_idx * ratio
-                
                 r0, g0, b0 = int(r_pos), int(g_pos), int(b_pos)
                 r1, g1, b1 = min(r0 + 1, size - 1), min(g0 + 1, size - 1), min(b0 + 1, size - 1)
-                
                 fr, fg, fb = r_pos - r0, g_pos - g0, b_pos - b0
-                
                 if fg >= fb and fb >= fr:
                     c0 = get_sample(r0, g0, b0)
                     c1 = get_sample(r0, g1, b0)
@@ -240,80 +209,41 @@ def interpolate_3d(samples, size, new_size=32):
                     c2 = get_sample(r1, g0, b1)
                     c3 = get_sample(r1, g1, b1)
                     w0, w1, w2, w3 = 1 - fr, fr - fb, fb - fg, fg
-                
                 out_r = c0[0]*w0 + c1[0]*w1 + c2[0]*w2 + c3[0]*w3
                 out_g = c0[1]*w0 + c1[1]*w1 + c2[1]*w2 + c3[1]*w3
                 out_b = c0[2]*w0 + c1[2]*w1 + c2[2]*w2 + c3[2]*w3
-                
                 new_samples.append((out_r, out_g, out_b))
-                
     return new_samples
 
 def build_xmp(title, size, samples):
     if size is None or not samples:
         raise ValueError("Invalid CUBE file")
-    
     if size > 32:
         samples = interpolate_3d(samples, size, 32)
         size = 32
-        
     nopValue = [(i * 0xFFFF + (size // 2)) // (size - 1) for i in range(size)]
-    
-    # Pack the binary block
-    # header[4] = { 1,1,3,size }
     block_data = bytearray()
     block_data.extend(struct.pack('<4I', 1, 1, 3, size))
-    
-    # samples (bIndex fast, gIndex, rIndex slow)
-    # The input `samples` from CUBE is usually rIndex fast? 
-    # Wait, CUBE standard: R changes fastest, then G, then B.
-    # So the order in the list `samples` is:
-    # index = r + g*size + b*size*size
-    # In C++, the loop is:
-    # bIndex, gIndex, rIndex
-    # j is the index in samples (r changes fastest)
-    # idx = 16 + (rIndex * size * size + gIndex * size + bIndex) * 3 * 2;
-    # So the output block wants:
-    # bIndex fastest, gIndex, rIndex slowest.
-    
-    # Let's create an empty array of the right size
     sample_bytes = bytearray(size * size * size * 6)
-    
     for b in range(size):
         for g in range(size):
             for r in range(size):
                 cube_idx = r + g * size + b * size * size
                 r_val, g_val, b_val = samples[cube_idx]
-                
-                # output idx where b changes fastest, then g, then r
                 out_idx = (r * size * size + g * size + b) * 6
-                
-                # int_round(val * 65535) - nopValue
                 temp_r = (int(round(r_val * 65535)) - nopValue[r]) & 0xFFFF
                 temp_g = (int(round(g_val * 65535)) - nopValue[g]) & 0xFFFF
                 temp_b = (int(round(b_val * 65535)) - nopValue[b]) & 0xFFFF
-                
                 struct.pack_into('<HHH', sample_bytes, out_idx, temp_r, temp_g, temp_b)
-                
     block_data.extend(sample_bytes)
-    
-    # footer[3] = { colors, gamma, gamut }
-    # sRGB = 0, 1, 0
     block_data.extend(struct.pack('<3I', 0, 1, 0))
-    
-    # range[2] = { min, max }
     block_data.extend(struct.pack('<2d', 0.0, 2.0))
-    
     uncompressed_size = len(block_data)
-    
     md5_hash = hashlib.md5(block_data).hexdigest()
     uuid_str = hashlib.md5((md5_hash + str(int(time.time()))).encode('utf-8')).hexdigest().upper()
-    
     z_data = zlib.compress(block_data, level=zlib.Z_DEFAULT_COMPRESSION)
     compressed_block = struct.pack('<I', uncompressed_size) + z_data
-    
     encoded_str = encode_zlib_base85(compressed_block)
-    
     xmp_template = f"""<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
@@ -369,34 +299,39 @@ def build_xmp(title, size, samples):
 """
     return xmp_template
 
-# ... (Keep existing parser and encoder code above) ...
-
 TRANSLATIONS = {
     "en": {
         "title": "LUT to XMP Converter",
         "tab_custom": "Custom .cube",
         "tab_presets": "Film Presets",
-        "custom_desc": "Convert your custom .cube LUT files to Adobe Camera Raw (.xmp) profiles.",
+        "custom_desc": "Convert your custom .cube LUT files to Adobe Camera Raw (.xmp) profiles.\nDrag and drop files here or click the button below.",
         "btn_select": "Select File & Convert",
         "preset_desc": "Export built-in film style LUTs (Fuji/NC) to XMP profiles.",
         "btn_export": "Export Selected Preset",
         "no_presets": "No presets found. Please run generate_fuji_luts.py first.",
         "ready": "Ready",
-        "parsing": "Parsing CUBE file...",
-        "building": "Building XMP profile (this might take a moment if resampling)...",
+        "parsing": "Parsing file...",
+        "building": "Building profile (this might take a moment if resampling)...",
         "success": "Success: Saved to {filename}",
         "cancelled": "Cancelled",
         "error": "Error occurred",
         "theme": "Theme",
         "language": "Language",
         "warn_no_preset": "No preset selected!",
-        "btn_convert_xmp_to_cube": "Convert XMP to .cube"
+        "btn_convert_xmp_to_cube": "Convert XMP to .cube",
+        "dialog_save_xmp": "Save XMP File",
+        "dialog_save_cube": "Save CUBE File",
+        "processing": "Processing...",
+        "cancel": "Cancel",
+        "preview_title": "Color Preview",
+        "before": "Original",
+        "after": "With LUT"
     },
     "zh": {
         "title": "LUT / XMP 转换器",
         "tab_custom": "双向转换",
         "tab_presets": "内置胶片预设",
-        "custom_desc": "在 .cube (LUT) 和 .xmp (Adobe 配置) 之间进行双向转换。\n选择文件后程序会自动识别格式。",
+        "custom_desc": "在 .cube (LUT) 和 .xmp (Adobe 配置) 之间进行双向转换。\n拖放文件到此处或点击下方按钮。",
         "btn_select": "选择文件并转换",
         "preset_desc": "导出内置的胶片风格 LUT（富士/NC滤镜）为 XMP 配置文件。",
         "btn_export": "导出所选预设",
@@ -410,21 +345,64 @@ TRANSLATIONS = {
         "theme": "外观",
         "language": "语言",
         "warn_no_preset": "未选择预设！",
-        "btn_convert_xmp_to_cube": "XMP 转 .cube"
+        "btn_convert_xmp_to_cube": "XMP 转 .cube",
+        "dialog_save_xmp": "保存 XMP 文件",
+        "dialog_save_cube": "保存 CUBE 文件",
+        "processing": "处理中...",
+        "cancel": "取消",
+        "preview_title": "颜色预览",
+        "before": "原始",
+        "after": "应用 LUT"
     }
 }
 
-class App(ctk.CTk):
+class ProgressDialog(ctk.CTkToplevel):
+    def __init__(self, parent, title, message, lang="en"):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.progress_var = tk.DoubleVar(value=0)
+        self.cancelled = False
+        self.geometry("350x150")
+        self.grid_columnconfigure(0, weight=1)
+        self.message_label = ctk.CTkLabel(self, text=message, wraplength=300)
+        self.message_label.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        self.progress_bar = ctk.CTkProgressBar(self, variable=self.progress_var)
+        self.progress_bar.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+        cancel_text = "Cancel" if lang == "en" else "取消"
+        self.cancel_btn = ctk.CTkButton(self, text=cancel_text, fg_color="red",
+                                        hover_color="darkred", command=self.cancel)
+        self.cancel_btn.grid(row=2, column=0, pady=10)
+
+    def cancel(self):
+        self.cancelled = True
+        self.progress_bar.configure(mode="indeterminate")
+
+    def update_progress(self, value):
+        self.progress_var.set(value)
+
+    def update_message(self, message):
+        self.message_label.configure(text=message)
+
+    def close(self):
+        self.grab_release()
+        self.destroy()
+
+class App(ctk.CTk, TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        
-        self.lang = "zh"  # Default language
-        
+        self.lang = "zh"
+        self.cancel_event = threading.Event()
         self.title(self.tr("title"))
-        self.geometry("600x400")
-        self.minsize(500, 350)  # Make it resizable with a minimum size
+        self.geometry("800x500")
+        self.minsize(600, 400)
         
-        # Main layout
+        # Enable drag and drop
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind('<<Drop>>', self.handle_drop)
+
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
         
@@ -433,7 +411,7 @@ class App(ctk.CTk):
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_rowconfigure(1, weight=1)
         
-        # Header / Top bar
+        # Header
         self.header_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.header_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
         self.header_frame.grid_columnconfigure(0, weight=1)
@@ -441,7 +419,7 @@ class App(ctk.CTk):
         self.title_lbl = ctk.CTkLabel(self.header_frame, text=self.tr("title"), font=ctk.CTkFont(size=24, weight="bold"))
         self.title_lbl.grid(row=0, column=0, sticky="w")
         
-        # Settings (Language & Theme)
+        # Settings
         self.settings_frame = ctk.CTkFrame(self.header_frame, fg_color="transparent")
         self.settings_frame.grid(row=0, column=1, sticky="e")
         
@@ -458,24 +436,45 @@ class App(ctk.CTk):
         
         self.tab_1_name = self.tr("tab_custom")
         self.tab_2_name = self.tr("tab_presets")
-        
         self.tabview.add(self.tab_1_name)
         self.tabview.add(self.tab_2_name)
         
         # Tab 1: Custom
         self.tabview.tab(self.tab_1_name).grid_columnconfigure(0, weight=1)
-        self.tabview.tab(self.tab_1_name).grid_rowconfigure(1, weight=1)
+        self.tabview.tab(self.tab_1_name).grid_rowconfigure(2, weight=1)
         
         self.lbl_custom = ctk.CTkLabel(self.tabview.tab(self.tab_1_name), text=self.tr("custom_desc"), font=ctk.CTkFont(size=14))
-        self.lbl_custom.grid(row=0, column=0, pady=(30, 20))
+        self.lbl_custom.grid(row=0, column=0, pady=(20, 10))
         
-        # UI Button Tweaks (avoiding bright blue)
         btn_color = ("#4A4A4A", "#333333")
         btn_hover_color = ("#5A5A5A", "#444444")
         
         self.btn_convert = ctk.CTkButton(self.tabview.tab(self.tab_1_name), text=self.tr("btn_select"), height=40, font=ctk.CTkFont(size=14, weight="bold"), 
                                          fg_color=btn_color, hover_color=btn_hover_color, command=self.convert)
         self.btn_convert.grid(row=1, column=0, pady=10)
+        
+        # Preview area
+        self.preview_frame = ctk.CTkFrame(self.tabview.tab(self.tab_1_name), corner_radius=10)
+        self.preview_frame.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+        self.preview_frame.grid_columnconfigure(0, weight=1)
+        self.preview_frame.grid_columnconfigure(1, weight=1)
+        
+        self.lbl_preview_title = ctk.CTkLabel(self.preview_frame, text=self.tr("preview_title"), font=ctk.CTkFont(size=12, weight="bold"))
+        self.lbl_preview_title.grid(row=0, column=0, columnspan=2, pady=(10, 5))
+        
+        self.lbl_before = ctk.CTkLabel(self.preview_frame, text=self.tr("before"), font=ctk.CTkFont(size=11))
+        self.lbl_before.grid(row=1, column=0, pady=5)
+        
+        self.lbl_after = ctk.CTkLabel(self.preview_frame, text=self.tr("after"), font=ctk.CTkFont(size=11))
+        self.lbl_after.grid(row=1, column=1, pady=5)
+        
+        self.canvas_before = tk.Canvas(self.preview_frame, width=150, height=100, bg='#808080')
+        self.canvas_before.grid(row=2, column=0, padx=10, pady=10)
+        
+        self.canvas_after = tk.Canvas(self.preview_frame, width=150, height=100, bg='#808080')
+        self.canvas_after.grid(row=2, column=1, padx=10, pady=10)
+        
+        self.draw_color_patches()
         
         # Tab 2: Presets
         self.tabview.tab(self.tab_2_name).grid_columnconfigure(0, weight=1)
@@ -513,15 +512,12 @@ class App(ctk.CTk):
     def update_ui_text(self):
         self.title(self.tr("title"))
         self.title_lbl.configure(text=self.tr("title"))
-        
-        # Rename tabs
-        old_tab1, old_tab2 = self.tab_1_name, self.tab_2_name
-        self.tab_1_name = self.tr("tab_custom")
-        self.tab_2_name = self.tr("tab_presets")
-        
         self.lbl_custom.configure(text=self.tr("custom_desc"))
         self.btn_convert.configure(text=self.tr("btn_select"))
         self.lbl_preset.configure(text=self.tr("preset_desc"))
+        self.lbl_preview_title.configure(text=self.tr("preview_title"))
+        self.lbl_before.configure(text=self.tr("before"))
+        self.lbl_after.configure(text=self.tr("after"))
         
         if hasattr(self, 'btn_export_preset'):
             self.btn_export_preset.configure(text=self.tr("btn_export"))
@@ -538,6 +534,73 @@ class App(ctk.CTk):
     def change_theme(self, choice):
         ctk.set_appearance_mode(choice)
 
+    def draw_color_patches(self):
+        self.canvas_before.delete('all')
+        colors = [
+            ('#FF0000', 10, 10),
+            ('#00FF00', 60, 10),
+            ('#0000FF', 110, 10),
+            ('#FFFF00', 10, 60),
+            ('#FF00FF', 60, 60),
+            ('#00FFFF', 110, 60),
+        ]
+        for color, x, y in colors:
+            self.canvas_before.create_rectangle(x, y, x+40, y+40, fill=color, outline='')
+        self.canvas_after.delete('all')
+        for color, x, y in colors:
+            self.canvas_after.create_rectangle(x, y, x+40, y+40, fill=color, outline='')
+
+    def apply_lut_to_color(self, r, g, b, samples, size):
+        r_idx = r * (size - 1)
+        g_idx = g * (size - 1)
+        b_idx = b * (size - 1)
+        r0, g0, b0 = int(r_idx), int(g_idx), int(b_idx)
+        r1, g1, b1 = min(r0 + 1, size - 1), min(g0 + 1, size - 1), min(b0 + 1, size - 1)
+        fr, fg, fb = r_idx - r0, g_idx - g0, b_idx - b0
+        
+        def get_sample(ri, gi, bi):
+            idx = ri + gi * size + bi * size * size
+            if idx < len(samples):
+                return samples[idx]
+            return (0.0, 0.0, 0.0)
+        
+        c000 = get_sample(r0, g0, b0)
+        c100 = get_sample(r1, g0, b0)
+        c010 = get_sample(r0, g1, b0)
+        c110 = get_sample(r1, g1, b0)
+        c001 = get_sample(r0, g0, b1)
+        c101 = get_sample(r1, g0, b1)
+        c011 = get_sample(r0, g1, b1)
+        c111 = get_sample(r1, g1, b1)
+        
+        result = []
+        for ch in range(3):
+            val = (c000[ch] * (1-fr) * (1-fg) * (1-fb) +
+                   c100[ch] * fr * (1-fg) * (1-fb) +
+                   c010[ch] * (1-fr) * fg * (1-fb) +
+                   c110[ch] * fr * fg * (1-fb) +
+                   c001[ch] * (1-fr) * (1-fg) * fb +
+                   c101[ch] * fr * (1-fg) * fb +
+                   c011[ch] * (1-fr) * fg * fb +
+                   c111[ch] * fr * fg * fb)
+            result.append(max(0.0, min(1.0, val)))
+        return result
+
+    def update_preview(self, samples, size):
+        colors = [
+            ((1.0, 0.0, 0.0), 10, 10),
+            ((0.0, 1.0, 0.0), 60, 10),
+            ((0.0, 0.0, 1.0), 110, 10),
+            ((1.0, 1.0, 0.0), 10, 60),
+            ((1.0, 0.0, 1.0), 60, 60),
+            ((0.0, 1.0, 1.0), 110, 60),
+        ]
+        self.canvas_after.delete('all')
+        for (r, g, b), x, y in colors:
+            new_r, new_g, new_b = self.apply_lut_to_color(r, g, b, samples, size)
+            hex_color = f'#{int(new_r*255):02x}{int(new_g*255):02x}{int(new_b*255):02x}'
+            self.canvas_after.create_rectangle(x, y, x+40, y+40, fill=hex_color, outline='')
+
     def set_status(self, msg_key, **kwargs):
         msg = self.tr(msg_key)
         if kwargs:
@@ -545,11 +608,25 @@ class App(ctk.CTk):
         self.status_var.set(msg)
         self.update()
 
+    def handle_drop(self, event):
+        file_path = event.data.strip('{}')
+        if os.path.isfile(file_path):
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.cube', '.xmp']:
+                self.set_status("parsing")
+                if ext == '.cube':
+                    self._process_cube_to_xmp(file_path)
+                else:
+                    self._process_xmp_to_cube(file_path)
+            else:
+                messagebox.showerror("Error", "Unsupported file format. Please drop .cube or .xmp file.")
+        else:
+            messagebox.showerror("Error", "Invalid file path.")
+
     def convert(self):
         file_path = filedialog.askopenfilename(filetypes=[("LUT or XMP files", "*.cube *.xmp"), ("CUBE files", "*.cube"), ("XMP files", "*.xmp")])
         if not file_path:
             return
-            
         ext = os.path.splitext(file_path)[1].lower()
         if ext == '.cube':
             self._process_cube_to_xmp(file_path)
@@ -564,71 +641,95 @@ class App(ctk.CTk):
             messagebox.showwarning("Warning", self.tr("warn_no_preset"))
             return
         file_path = os.path.join("built_in_luts", selected)
-        
         ext = os.path.splitext(file_path)[1].lower()
         if ext == '.cube':
             self._process_cube_to_xmp(file_path, is_preset=True)
         elif ext == '.xmp':
-            # 如果内置预设已经是 xmp，我们可以选择直接让用户另存为 xmp，或者提供转换为 cube 的选项
-            # 既然叫导出预设，通常用户希望得到最终的 xmp 或 cube。我们弹出一个对话框让用户选择要保存为什么格式。
-            # 为了简单起见，如果内置是 xmp，我们将其转换为 cube（如果用户需要的话），或者直接另存。
-            # 这里统一按照双向转换逻辑处理：如果选了 xmp，默认转成 cube；如果选了 cube，默认转成 xmp。
-            # 也可以直接调用 _process_xmp_to_cube
             self._process_xmp_to_cube(file_path)
         
     def _process_cube_to_xmp(self, file_path, is_preset=False):
-        try:
-            self.set_status("parsing")
-            title, size, samples = parse_cube(file_path)
-            
-            self.set_status("building")
-            xmp_content = build_xmp(title, size, samples)
-            
-            default_name = title.replace(" ", "_") + ".xmp" if is_preset else os.path.basename(file_path).replace(".cube", ".xmp")
-            
-            out_path = filedialog.asksaveasfilename(
-                defaultextension=".xmp",
-                filetypes=[("XMP files", "*.xmp")],
-                initialfile=default_name
-            )
-            
-            if out_path:
-                with open(out_path, 'w', encoding='utf-8') as f:
-                    f.write(xmp_content)
-                self.set_status("success", filename=os.path.basename(out_path))
-                messagebox.showinfo("Success", f"{self.tr('success').format(filename=os.path.basename(out_path))}\n{out_path}")
-            else:
-                self.set_status("cancelled")
-                
-        except Exception as e:
-            self.set_status("error")
-            messagebox.showerror("Error", str(e))
+        self.cancel_event.clear()
+        dialog = ProgressDialog(self, self.tr("processing"), self.tr("parsing"), self.lang)
+        def process():
+            try:
+                title, size, samples = parse_cube(file_path)
+                if not samples:
+                    raise ValueError("No valid color samples found in CUBE file")
+                if dialog.cancelled:
+                    self.set_status("cancelled")
+                    dialog.close()
+                    return
+                dialog.update_progress(0.3)
+                dialog.update_message(self.tr("building"))
+                self.update_preview(samples, size)
+                xmp_content = build_xmp(title, size, samples)
+                if dialog.cancelled:
+                    self.set_status("cancelled")
+                    dialog.close()
+                    return
+                dialog.update_progress(0.7)
+                default_name = title.replace(" ", "_") + ".xmp" if is_preset else os.path.basename(file_path).replace(".cube", ".xmp")
+                dialog.update_progress(0.9)
+                dialog.close()
+                out_path = filedialog.asksaveasfilename(
+                    title=self.tr("dialog_save_xmp"),
+                    defaultextension=".xmp",
+                    filetypes=[("XMP files", "*.xmp")],
+                    initialfile=default_name
+                )
+                if out_path:
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        f.write(xmp_content)
+                    self.set_status("success", filename=os.path.basename(out_path))
+                    messagebox.showinfo("Success", f"{self.tr('success').format(filename=os.path.basename(out_path))}\n{out_path}")
+                else:
+                    self.set_status("cancelled")
+            except Exception as e:
+                dialog.close()
+                self.set_status("error")
+                messagebox.showerror("Error", f"Failed to convert CUBE to XMP:\n{str(e)}")
+        threading.Thread(target=process, daemon=True).start()
 
     def _process_xmp_to_cube(self, file_path):
-        try:
-            self.set_status("parsing")
-            title, size, samples = parse_xmp(file_path)
-            
-            self.set_status("building")
-            cube_content = build_cube(title, size, samples)
-            
-            out_path = filedialog.asksaveasfilename(
-                defaultextension=".cube",
-                filetypes=[("CUBE files", "*.cube")],
-                initialfile=os.path.basename(file_path).replace(".xmp", ".cube")
-            )
-            
-            if out_path:
-                with open(out_path, 'w', encoding='utf-8') as f:
-                    f.write(cube_content)
-                self.set_status("success", filename=os.path.basename(out_path))
-                messagebox.showinfo("Success", f"{self.tr('success').format(filename=os.path.basename(out_path))}\n{out_path}")
-            else:
-                self.set_status("cancelled")
-                
-        except Exception as e:
-            self.set_status("error")
-            messagebox.showerror("Error", f"Failed to convert XMP to CUBE:\n{str(e)}")
+        self.cancel_event.clear()
+        dialog = ProgressDialog(self, self.tr("processing"), self.tr("parsing"), self.lang)
+        def process():
+            try:
+                title, size, samples = parse_xmp(file_path)
+                if not samples:
+                    raise ValueError("No valid color samples found in XMP file")
+                if dialog.cancelled:
+                    self.set_status("cancelled")
+                    dialog.close()
+                    return
+                dialog.update_progress(0.3)
+                dialog.update_message(self.tr("building"))
+                self.draw_color_patches()
+                cube_content = build_cube(title, size, samples)
+                if dialog.cancelled:
+                    self.set_status("cancelled")
+                    dialog.close()
+                    return
+                dialog.update_progress(0.7)
+                dialog.close()
+                out_path = filedialog.asksaveasfilename(
+                    title=self.tr("dialog_save_cube"),
+                    defaultextension=".cube",
+                    filetypes=[("CUBE files", "*.cube")],
+                    initialfile=os.path.basename(file_path).replace(".xmp", ".cube")
+                )
+                if out_path:
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        f.write(cube_content)
+                    self.set_status("success", filename=os.path.basename(out_path))
+                    messagebox.showinfo("Success", f"{self.tr('success').format(filename=os.path.basename(out_path))}\n{out_path}")
+                else:
+                    self.set_status("cancelled")
+            except Exception as e:
+                dialog.close()
+                self.set_status("error")
+                messagebox.showerror("Error", f"Failed to convert XMP to CUBE:\n{str(e)}")
+        threading.Thread(target=process, daemon=True).start()
 
 if __name__ == "__main__":
     app = App()
