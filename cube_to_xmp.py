@@ -1,46 +1,146 @@
+"""
+CUBE-to-XMP  v2.0
+Professional LUT conversion tool for colorists and photographers.
+CUBE (3D LUT) <-> XMP (Adobe Camera Raw) bidirectional converter.
+
+Premium dark interface inspired by DaVinci Resolve / Adobe Lightroom.
+"""
+
 import os
 import re
 import struct
 import zlib
 import hashlib
 import time
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from datetime import datetime
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD, DND_FILES
+import ctypes
 
-# Configure global customtkinter settings
-ctk.set_appearance_mode("System")
+# ============================================================
+# BASE PATH (for PyInstaller)
+# ============================================================
+if getattr(sys, 'frozen', False):
+    BASE_PATH = sys._MEIPASS
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+# ============================================================
+# COLOR PALETTES — Dark & Light
+# ============================================================
+C_DARK = {
+    "bg":           "#08080A",
+    "surface_0":    "#0E0E12",
+    "surface_1":    "#141419",
+    "surface_2":    "#1A1A21",
+    "surface_3":    "#22222B",
+    "border":       "#2A2A35",
+    "border_act":   "#404055",
+    "accent":       "#00D4AA",
+    "accent_dim":   "#00A885",
+    "accent_2":     "#4DA6FF",
+    "text":         "#E4E4EA",
+    "text_sec":     "#90909A",
+    "text_muted":   "#585862",
+    "success":      "#34C759",
+    "warning":      "#FF9F0A",
+    "error":        "#FF453A",
+    "drop_bg":      "#101016",
+    "drop_border":  "#353545",
+    "drop_border_h":"#00D4AA55",
+}
+
+C_LIGHT = {
+    "bg":           "#F2F2F7",
+    "surface_0":    "#FFFFFF",
+    "surface_1":    "#F9F9FC",
+    "surface_2":    "#E8E8EE",
+    "surface_3":    "#DDDDE5",
+    "border":       "#D1D1D8",
+    "border_act":   "#A0A0AE",
+    "accent":       "#00A885",
+    "accent_dim":   "#008060",
+    "accent_2":     "#3B82F6",
+    "text":         "#1D1D1F",
+    "text_sec":     "#6E6E77",
+    "text_muted":   "#A0A0AB",
+    "success":      "#30B250",
+    "warning":      "#E8900A",
+    "error":        "#E83030",
+    "drop_bg":      "#EBEBF2",
+    "drop_border":  "#CCCCD5",
+    "drop_border_h":"#00A88555",
+}
+
+C = dict(C_DARK)  # Start with dark theme
+
+# ============================================================
+# FONTS — Load bundled font files via Windows API
+# ============================================================
+FONTS_DIR = os.path.join(BASE_PATH, "fonts")
+
+# Register bundled .otf/.ttf files with Windows (current session only, no admin needed)
+if sys.platform == "win32" and os.path.isdir(FONTS_DIR):
+    for fname in os.listdir(FONTS_DIR):
+        fpath = os.path.join(FONTS_DIR, fname)
+        if fname.lower().endswith((".otf", ".ttf")):
+            try:
+                ctypes.windll.gdi32.AddFontResourceW(fpath)
+            except Exception:
+                pass
+
+# Font families — if bundled fonts are registered, they'll be available.
+# tkinter gracefully falls back to system fonts if a family is not found.
+FONT_FAMILY = "Inter"
+TITLE_FONT_FAMILY = "Montserrat"  # Used for "CUBE to XMP" title
+MONO_FAMILY = "Consolas"
+
+
+def font(size=13, weight="normal", family=None):
+    """Create a CTkFont — body text."""
+    return ctk.CTkFont(family=family or FONT_FAMILY, size=size, weight=weight)
+
+
+def title_font(size=22, weight="bold"):
+    """Font for app title — uses TITLE_FONT_FAMILY."""
+    return ctk.CTkFont(family=TITLE_FONT_FAMILY, size=size, weight=weight)
+
+
+def mono_font(size=12):
+    """Monospace font for code/paths."""
+    return ctk.CTkFont(family=MONO_FAMILY, size=size)
+
+# ============================================================
+# GLOBAL THEME SETUP
+# ============================================================
+ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
 
+# ============================================================
+# CONVERSION FUNCTIONS
+# ============================================================
 kEncodeTable = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?`'|()[]{}@%$#"
+
 
 def parse_xmp(file_path):
     import xml.etree.ElementTree as ET
-    
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
-        
     title = "Extracted_LUT"
     title_match = re.search(r'<crs:Name>\s*<rdf:Alt>\s*<rdf:li xml:lang="x-default">(.*?)</rdf:li>', content, re.DOTALL)
     if title_match:
         title = title_match.group(1).strip()
-        
     table_match = re.search(r'crs:Table_[A-F0-9]+="([^"]+)"', content)
     if not table_match:
         raise ValueError("Valid RGBTable data not found in XMP.")
-        
     encoded_str = table_match.group(1)
-    
-    kDecodeTable = {}
-    for i, c in enumerate(kEncodeTable):
-        kDecodeTable[c] = i
-        
+    kDecodeTable = {c: i for i, c in enumerate(kEncodeTable)}
     compressed_data = bytearray()
-    val = 0
-    phase = 0
-    
+    val, phase = 0, 0
     for c in encoded_str:
         if c not in kDecodeTable:
             continue
@@ -50,39 +150,29 @@ def parse_xmp(file_path):
         elif phase == 2: val += d * 85
         elif phase == 3: val += d * (85 * 85)
         elif phase == 4: val += d * (85 * 85 * 85)
-        elif phase == 5: 
+        elif phase == 5:
             val += d * (85 * 85 * 85 * 85)
             compressed_data.extend(struct.pack('<I', val))
             phase = 0
-            
     if phase > 0:
         if phase == 2: compressed_data.extend(struct.pack('<B', val & 0xFF))
         elif phase == 3: compressed_data.extend(struct.pack('<H', val & 0xFFFF))
         elif phase == 4: compressed_data.extend(struct.pack('<I', val)[:3])
-        
     if len(compressed_data) < 4:
         raise ValueError("Invalid compressed data size")
-        
     uncompressed_size = struct.unpack('<I', compressed_data[:4])[0]
     z_data = compressed_data[4:]
-    
     try:
         block_data = zlib.decompress(z_data)
     except zlib.error:
         block_data = zlib.decompress(z_data, bufsize=uncompressed_size)
-        
     if len(block_data) < 16:
         raise ValueError("Invalid uncompressed data block")
-        
     h_v1, h_v2, dims, size = struct.unpack('<4I', block_data[:16])
-    
     if dims != 3:
         raise ValueError(f"Only 3D LUTs are supported (found {dims}D)")
-        
+    lut_3d = [[[(0, 0, 0) for _ in range(size)] for _ in range(size)] for _ in range(size)]
     nopValue = [(i * 0xFFFF + (size // 2)) // (size - 1) for i in range(size)]
-    samples = []
-    lut_3d = [[[ (0,0,0) for _ in range(size)] for _ in range(size)] for _ in range(size)]
-    
     offset = 16
     for b in range(size):
         for g in range(size):
@@ -91,28 +181,31 @@ def parse_xmp(file_path):
                     break
                 temp_r, temp_g, temp_b = struct.unpack('<HHH', block_data[offset:offset+6])
                 offset += 6
-                r_val = (temp_r + nopValue[r]) / 65535.0
-                g_val = (temp_g + nopValue[g]) / 65535.0
-                b_val = (temp_b + nopValue[b]) / 65535.0
-                lut_3d[r][g][b] = (r_val, g_val, b_val)
-                
+                lut_3d[r][g][b] = (
+                    (temp_r + nopValue[r]) / 65535.0,
+                    (temp_g + nopValue[g]) / 65535.0,
+                    (temp_b + nopValue[b]) / 65535.0,
+                )
+    samples = []
     for b in range(size):
         for g in range(size):
             for r in range(size):
                 samples.append(lut_3d[r][g][b])
-                
     return title, size, samples
 
+
 def build_cube(title, size, samples):
-    lines = []
-    lines.append(f'TITLE "{title}"')
-    lines.append(f'LUT_3D_SIZE {size}')
-    lines.append('DOMAIN_MIN 0.0 0.0 0.0')
-    lines.append('DOMAIN_MAX 1.0 1.0 1.0')
-    lines.append('')
+    lines = [
+        f'TITLE "{title}"',
+        f'LUT_3D_SIZE {size}',
+        'DOMAIN_MIN 0.0 0.0 0.0',
+        'DOMAIN_MAX 1.0 1.0 1.0',
+        '',
+    ]
     for r, g, b in samples:
         lines.append(f"{r:.6f} {g:.6f} {b:.6f}")
     return '\n'.join(lines)
+
 
 def encode_zlib_base85(data: bytes) -> str:
     padded_data = data + b'\x00\x00\x00'
@@ -128,6 +221,7 @@ def encode_zlib_base85(data: bytes) -> str:
                 if compressed_size == 0:
                     break
     return "".join(encoded_chars)
+
 
 def parse_cube(file_path):
     size = None
@@ -150,20 +244,22 @@ def parse_cube(file_path):
                 parts = line.split()
                 if len(parts) >= 3:
                     try:
-                        r, g, b = float(parts[0]), float(parts[1]), float(parts[2])
-                        samples.append((r, g, b))
+                        samples.append((float(parts[0]), float(parts[1]), float(parts[2])))
                     except ValueError:
                         pass
     return title, size, samples
 
+
 def interpolate_3d(samples, size, new_size=32):
     new_samples = []
     ratio = (size - 1.0) / (new_size - 1.0)
+
     def get_sample(r, g, b):
         r = max(0, min(size - 1, r))
         g = max(0, min(size - 1, g))
         b = max(0, min(size - 1, b))
         return samples[r + g * size + b * size * size]
+
     for b_idx in range(new_size):
         for g_idx in range(new_size):
             for r_idx in range(new_size):
@@ -173,47 +269,39 @@ def interpolate_3d(samples, size, new_size=32):
                 r0, g0, b0 = int(r_pos), int(g_pos), int(b_pos)
                 r1, g1, b1 = min(r0 + 1, size - 1), min(g0 + 1, size - 1), min(b0 + 1, size - 1)
                 fr, fg, fb = r_pos - r0, g_pos - g0, b_pos - b0
+
                 if fg >= fb and fb >= fr:
-                    c0 = get_sample(r0, g0, b0)
-                    c1 = get_sample(r0, g1, b0)
-                    c2 = get_sample(r0, g1, b1)
-                    c3 = get_sample(r1, g1, b1)
+                    c0, c1, c2, c3 = (get_sample(r0, g0, b0), get_sample(r0, g1, b0),
+                                       get_sample(r0, g1, b1), get_sample(r1, g1, b1))
                     w0, w1, w2, w3 = 1 - fg, fg - fb, fb - fr, fr
                 elif fb > fr and fr > fg:
-                    c0 = get_sample(r0, g0, b0)
-                    c1 = get_sample(r0, g0, b1)
-                    c2 = get_sample(r1, g0, b1)
-                    c3 = get_sample(r1, g1, b1)
+                    c0, c1, c2, c3 = (get_sample(r0, g0, b0), get_sample(r0, g0, b1),
+                                       get_sample(r1, g0, b1), get_sample(r1, g1, b1))
                     w0, w1, w2, w3 = 1 - fb, fb - fr, fr - fg, fg
                 elif fb > fg and fg >= fr:
-                    c0 = get_sample(r0, g0, b0)
-                    c1 = get_sample(r0, g0, b1)
-                    c2 = get_sample(r0, g1, b1)
-                    c3 = get_sample(r1, g1, b1)
+                    c0, c1, c2, c3 = (get_sample(r0, g0, b0), get_sample(r0, g0, b1),
+                                       get_sample(r0, g1, b1), get_sample(r1, g1, b1))
                     w0, w1, w2, w3 = 1 - fb, fb - fg, fg - fr, fr
                 elif fr >= fg and fg > fb:
-                    c0 = get_sample(r0, g0, b0)
-                    c1 = get_sample(r1, g0, b0)
-                    c2 = get_sample(r1, g1, b0)
-                    c3 = get_sample(r1, g1, b1)
+                    c0, c1, c2, c3 = (get_sample(r0, g0, b0), get_sample(r1, g0, b0),
+                                       get_sample(r1, g1, b0), get_sample(r1, g1, b1))
                     w0, w1, w2, w3 = 1 - fr, fr - fg, fg - fb, fb
                 elif fg > fr and fr >= fb:
-                    c0 = get_sample(r0, g0, b0)
-                    c1 = get_sample(r0, g1, b0)
-                    c2 = get_sample(r1, g1, b0)
-                    c3 = get_sample(r1, g1, b1)
+                    c0, c1, c2, c3 = (get_sample(r0, g0, b0), get_sample(r0, g1, b0),
+                                       get_sample(r1, g1, b0), get_sample(r1, g1, b1))
                     w0, w1, w2, w3 = 1 - fg, fg - fr, fr - fb, fb
                 else:
-                    c0 = get_sample(r0, g0, b0)
-                    c1 = get_sample(r1, g0, b0)
-                    c2 = get_sample(r1, g0, b1)
-                    c3 = get_sample(r1, g1, b1)
+                    c0, c1, c2, c3 = (get_sample(r0, g0, b0), get_sample(r1, g0, b0),
+                                       get_sample(r1, g0, b1), get_sample(r1, g1, b1))
                     w0, w1, w2, w3 = 1 - fr, fr - fb, fb - fg, fg
-                out_r = c0[0]*w0 + c1[0]*w1 + c2[0]*w2 + c3[0]*w3
-                out_g = c0[1]*w0 + c1[1]*w1 + c2[1]*w2 + c3[1]*w3
-                out_b = c0[2]*w0 + c1[2]*w1 + c2[2]*w2 + c3[2]*w3
-                new_samples.append((out_r, out_g, out_b))
+
+                new_samples.append((
+                    c0[0] * w0 + c1[0] * w1 + c2[0] * w2 + c3[0] * w3,
+                    c0[1] * w0 + c1[1] * w1 + c2[1] * w2 + c3[1] * w3,
+                    c0[2] * w0 + c1[2] * w1 + c2[2] * w2 + c3[2] * w3,
+                ))
     return new_samples
+
 
 def build_xmp(title, size, samples):
     if size is None or not samples:
@@ -244,7 +332,8 @@ def build_xmp(title, size, samples):
     z_data = zlib.compress(block_data, level=zlib.Z_DEFAULT_COMPRESSION)
     compressed_block = struct.pack('<I', uncompressed_size) + z_data
     encoded_str = encode_zlib_base85(compressed_block)
-    xmp_template = f"""<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+
+    return f"""<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
     xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
@@ -297,282 +386,393 @@ def build_xmp(title, size, samples):
  </rdf:RDF>
 </x:xmpmeta>
 """
-    return xmp_template
 
-TRANSLATIONS = {
-    "en": {
-        "title": "LUT to XMP Converter",
-        "tab_custom": "Custom .cube",
-        "tab_presets": "Film Presets",
-        "custom_desc": "Convert your custom .cube LUT files to Adobe Camera Raw (.xmp) profiles.\nDrag and drop files here or click the button below.",
-        "btn_select": "Select File & Convert",
-        "preset_desc": "Export built-in film style LUTs (Fuji/NC) to XMP profiles.",
-        "btn_export": "Export Selected Preset",
-        "no_presets": "No presets found. Please run generate_fuji_luts.py first.",
-        "ready": "Ready",
-        "parsing": "Parsing file...",
-        "building": "Building profile (this might take a moment if resampling)...",
-        "success": "Success: Saved to {filename}",
-        "cancelled": "Cancelled",
-        "error": "Error occurred",
-        "theme": "Theme",
-        "language": "Language",
-        "warn_no_preset": "No preset selected!",
-        "btn_convert_xmp_to_cube": "Convert XMP to .cube",
-        "dialog_save_xmp": "Save XMP File",
-        "dialog_save_cube": "Save CUBE File",
-        "processing": "Processing...",
-        "cancel": "Cancel",
-        "preview_title": "Color Preview",
-        "before": "Original",
-        "after": "With LUT"
-    },
+# ============================================================
+# TRANSLATIONS
+# ============================================================
+T = {
     "zh": {
-        "title": "LUT / XMP 转换器",
-        "tab_custom": "双向转换",
-        "tab_presets": "内置胶片预设",
-        "custom_desc": "在 .cube (LUT) 和 .xmp (Adobe 配置) 之间进行双向转换。\n拖放文件到此处或点击下方按钮。",
-        "btn_select": "选择文件并转换",
-        "preset_desc": "导出内置的胶片风格 LUT（富士/NC滤镜）为 XMP 配置文件。",
-        "btn_export": "导出所选预设",
-        "no_presets": "未找到预设。请先运行 generate_fuji_luts.py。",
+        "title": "CUBE to XMP",
+        "subtitle": "专业 LUT 转换工具",
+        "tab_library": "LUT 库",
+        "tab_convert": "转换",
+        "presets": "内置预设",
+        "recent": "最近使用",
+        "no_presets": "未找到预设文件",
+        "no_recent": "暂无转换记录",
+        "drop_title": "拖放文件到此处",
+        "drop_sub": "支持 .cube 和 .xmp 格式",
+        "btn_browse": "选择文件",
+        "btn_export": "导出",
+        "btn_export_xmp": "导出 XMP",
+        "btn_export_cube": "导出 CUBE",
+        "lut_info": "LUT 信息",
+        "lut_name": "名称",
+        "lut_size": "尺寸",
+        "lut_type": "类型",
+        "lut_path": "路径",
+        "params": "输出参数",
+        "param_group": "分组",
+        "param_desc": "描述",
+        "history": "转换历史",
         "ready": "就绪",
         "parsing": "正在解析文件...",
         "building": "正在构建配置文件...",
-        "success": "成功：已保存至 {filename}",
+        "success": "已保存: {filename}",
         "cancelled": "已取消",
         "error": "发生错误",
-        "theme": "外观",
-        "language": "语言",
-        "warn_no_preset": "未选择预设！",
-        "btn_convert_xmp_to_cube": "XMP 转 .cube",
-        "dialog_save_xmp": "保存 XMP 文件",
-        "dialog_save_cube": "保存 CUBE 文件",
         "processing": "处理中...",
         "cancel": "取消",
-        "preview_title": "颜色预览",
+        "preview": "色彩预览",
         "before": "原始",
-        "after": "应用 LUT"
-    }
+        "after": "应用 LUT",
+        "direction_cube_to_xmp": "CUBE → XMP",
+        "direction_xmp_to_cube": "XMP → CUBE",
+        "action_convert": "转换",
+        "action_clear": "清空历史",
+        "file_cube": "CUBE 文件",
+        "file_xmp": "XMP 文件",
+    },
+    "en": {
+        "title": "CUBE to XMP",
+        "subtitle": "Professional LUT Converter",
+        "tab_library": "LUT Library",
+        "tab_convert": "Convert",
+        "presets": "Built-in Presets",
+        "recent": "Recent",
+        "no_presets": "No preset files found",
+        "no_recent": "No conversion history",
+        "drop_title": "Drop files here",
+        "drop_sub": "Supports .cube and .xmp formats",
+        "btn_browse": "Browse Files",
+        "btn_export": "Export",
+        "btn_export_xmp": "Export XMP",
+        "btn_export_cube": "Export CUBE",
+        "lut_info": "LUT Information",
+        "lut_name": "Name",
+        "lut_size": "Size",
+        "lut_type": "Type",
+        "lut_path": "Path",
+        "params": "Output Parameters",
+        "param_group": "Group",
+        "param_desc": "Description",
+        "history": "Conversion History",
+        "ready": "Ready",
+        "parsing": "Parsing file...",
+        "building": "Building profile...",
+        "success": "Saved: {filename}",
+        "cancelled": "Cancelled",
+        "error": "Error occurred",
+        "processing": "Processing...",
+        "cancel": "Cancel",
+        "preview": "Color Preview",
+        "before": "Original",
+        "after": "With LUT",
+        "direction_cube_to_xmp": "CUBE → XMP",
+        "direction_xmp_to_cube": "XMP → CUBE",
+        "action_convert": "Convert",
+        "action_clear": "Clear History",
+        "file_cube": "CUBE File",
+        "file_xmp": "XMP File",
+    },
 }
 
-class ProgressDialog(ctk.CTkToplevel):
-    def __init__(self, parent, title, message, lang="en"):
-        super().__init__(parent)
-        self.title(title)
-        self.transient(parent)
-        self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", lambda: None)
-        self.progress_var = tk.DoubleVar(value=0)
-        self.cancelled = False
-        self.geometry("350x150")
-        self.grid_columnconfigure(0, weight=1)
-        self.message_label = ctk.CTkLabel(self, text=message, wraplength=300)
-        self.message_label.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
-        self.progress_bar = ctk.CTkProgressBar(self, variable=self.progress_var)
-        self.progress_bar.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
-        cancel_text = "Cancel" if lang == "en" else "取消"
-        self.cancel_btn = ctk.CTkButton(self, text=cancel_text, fg_color="red",
-                                        hover_color="darkred", command=self.cancel)
-        self.cancel_btn.grid(row=2, column=0, pady=10)
+# ============================================================
+# CUSTOM UI COMPONENTS
+# ============================================================
 
-    def cancel(self):
-        self.cancelled = True
-        self.progress_bar.configure(mode="indeterminate")
+class Card(ctk.CTkFrame):
+    """Premium card frame with subtle border and rounded corners."""
+    def __init__(self, parent, **kwargs):
+        super().__init__(
+            parent,
+            fg_color=C["surface_1"],
+            border_width=1,
+            border_color=C["border"],
+            corner_radius=10,
+            **kwargs,
+        )
 
-    def update_progress(self, value):
-        self.progress_var.set(value)
+    def _update_theme(self, C_):
+        self.configure(fg_color=C_["surface_1"], border_color=C_["border"])
 
-    def update_message(self, message):
-        self.message_label.configure(text=message)
 
-    def close(self):
-        self.grab_release()
-        self.destroy()
+class SectionHeader(ctk.CTkLabel):
+    """Uppercase section label with subdued color."""
+    def __init__(self, parent, text, **kwargs):
+        super().__init__(
+            parent,
+            text=text.upper(),
+            font=font(11, "bold"),
+            text_color=C["text_sec"],
+            anchor="w",
+            **kwargs,
+        )
 
-class App(ctk.CTk, TkinterDnD.Tk):
-    def __init__(self):
-        super().__init__()
-        self.lang = "zh"
-        self.cancel_event = threading.Event()
-        self.title(self.tr("title"))
-        self.geometry("800x500")
-        self.minsize(600, 400)
-        
-        # Enable drag and drop
-        self.drop_target_register(DND_FILES)
-        self.dnd_bind('<<Drop>>', self.handle_drop)
 
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-        
-        self.main_frame = ctk.CTkFrame(self, corner_radius=15)
-        self.main_frame.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
-        self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(1, weight=1)
-        
-        # Header
-        self.header_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.header_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
-        self.header_frame.grid_columnconfigure(0, weight=1)
-        
-        self.title_lbl = ctk.CTkLabel(self.header_frame, text=self.tr("title"), font=ctk.CTkFont(size=24, weight="bold"))
-        self.title_lbl.grid(row=0, column=0, sticky="w")
-        
-        # Settings
-        self.settings_frame = ctk.CTkFrame(self.header_frame, fg_color="transparent")
-        self.settings_frame.grid(row=0, column=1, sticky="e")
-        
-        self.lang_switch = ctk.CTkOptionMenu(self.settings_frame, values=["中文", "English"], width=80, command=self.change_language)
-        self.lang_switch.set("中文")
-        self.lang_switch.pack(side="left", padx=(0, 10))
-        
-        self.theme_switch = ctk.CTkOptionMenu(self.settings_frame, values=["System", "Dark", "Light"], width=90, command=self.change_theme)
-        self.theme_switch.pack(side="left")
-        
-        # Tab view
-        self.tabview = ctk.CTkTabview(self.main_frame, corner_radius=10)
-        self.tabview.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
-        
-        self.tab_1_name = self.tr("tab_custom")
-        self.tab_2_name = self.tr("tab_presets")
-        self.tabview.add(self.tab_1_name)
-        self.tabview.add(self.tab_2_name)
-        
-        # Tab 1: Custom
-        self.tabview.tab(self.tab_1_name).grid_columnconfigure(0, weight=1)
-        self.tabview.tab(self.tab_1_name).grid_rowconfigure(2, weight=1)
-        
-        self.lbl_custom = ctk.CTkLabel(self.tabview.tab(self.tab_1_name), text=self.tr("custom_desc"), font=ctk.CTkFont(size=14))
-        self.lbl_custom.grid(row=0, column=0, pady=(20, 10))
-        
-        btn_color = ("#4A4A4A", "#333333")
-        btn_hover_color = ("#5A5A5A", "#444444")
-        
-        self.btn_convert = ctk.CTkButton(self.tabview.tab(self.tab_1_name), text=self.tr("btn_select"), height=40, font=ctk.CTkFont(size=14, weight="bold"), 
-                                         fg_color=btn_color, hover_color=btn_hover_color, command=self.convert)
-        self.btn_convert.grid(row=1, column=0, pady=10)
-        
-        # Preview area
-        self.preview_frame = ctk.CTkFrame(self.tabview.tab(self.tab_1_name), corner_radius=10)
-        self.preview_frame.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
-        self.preview_frame.grid_columnconfigure(0, weight=1)
-        self.preview_frame.grid_columnconfigure(1, weight=1)
-        
-        self.lbl_preview_title = ctk.CTkLabel(self.preview_frame, text=self.tr("preview_title"), font=ctk.CTkFont(size=12, weight="bold"))
-        self.lbl_preview_title.grid(row=0, column=0, columnspan=2, pady=(10, 5))
-        
-        self.lbl_before = ctk.CTkLabel(self.preview_frame, text=self.tr("before"), font=ctk.CTkFont(size=11))
-        self.lbl_before.grid(row=1, column=0, pady=5)
-        
-        self.lbl_after = ctk.CTkLabel(self.preview_frame, text=self.tr("after"), font=ctk.CTkFont(size=11))
-        self.lbl_after.grid(row=1, column=1, pady=5)
-        
-        self.canvas_before = tk.Canvas(self.preview_frame, width=150, height=100, bg='#808080')
-        self.canvas_before.grid(row=2, column=0, padx=10, pady=10)
-        
-        self.canvas_after = tk.Canvas(self.preview_frame, width=150, height=100, bg='#808080')
-        self.canvas_after.grid(row=2, column=1, padx=10, pady=10)
-        
-        self.draw_color_patches()
-        
-        # Tab 2: Presets
-        self.tabview.tab(self.tab_2_name).grid_columnconfigure(0, weight=1)
-        self.tabview.tab(self.tab_2_name).grid_rowconfigure(2, weight=1)
-        
-        self.lbl_preset = ctk.CTkLabel(self.tabview.tab(self.tab_2_name), text=self.tr("preset_desc"), font=ctk.CTkFont(size=14))
-        self.lbl_preset.grid(row=0, column=0, pady=(30, 20))
-        
-        self.preset_var = tk.StringVar()
-        self.presets = []
-        if os.path.exists("built_in_luts"):
-            self.presets = [f for f in os.listdir("built_in_luts") if f.endswith(".cube") or f.endswith(".xmp")]
-            
-        if not self.presets:
-            self.lbl_no_presets = ctk.CTkLabel(self.tabview.tab(self.tab_2_name), text=self.tr("no_presets"), text_color="red")
-            self.lbl_no_presets.grid(row=1, column=0)
+class PresetItem(ctk.CTkFrame):
+    """Clickable preset card in the left sidebar."""
+    def __init__(self, parent, name, file_path, on_click=None, **kwargs):
+        super().__init__(
+            parent,
+            fg_color=C["surface_2"],
+            border_width=1,
+            border_color=C["border"],
+            corner_radius=8,
+            height=44,
+            **kwargs,
+        )
+        self.file_path = file_path
+        self.on_click = on_click
+        self._selected = False
+
+        # Dot indicator
+        ext = os.path.splitext(name)[1].lower()
+        self._dot_is_cube = (ext == ".cube")
+        dot_fill = C["accent"] if self._dot_is_cube else C["accent_2"]
+        self.dot = tk.Canvas(self, width=8, height=8, bg=C["surface_2"], highlightthickness=0)
+        self.dot.create_oval(0, 0, 8, 8, fill=dot_fill, outline="")
+        self.dot.pack(side="left", padx=(12, 8), pady=0)
+        self.dot.configure(bg=C["surface_2"])
+
+        # Name
+        display_name = os.path.splitext(name)[0].replace("_", " ")
+        self.label = ctk.CTkLabel(
+            self, text=display_name, font=font(12),
+            text_color=C["text_sec"], anchor="w",
+        )
+        self.label.pack(side="left", fill="x", expand=True, padx=(0, 12))
+
+        # Bind click
+        for widget in [self, self.label, self.dot]:
+            widget.bind("<Button-1>", lambda e: self._handle_click())
+            widget.bind("<Enter>", lambda e: self._on_hover(True))
+            widget.bind("<Leave>", lambda e: self._on_hover(False))
+
+    def _handle_click(self):
+        if self.on_click:
+            self.on_click(self.file_path)
+        self.set_selected(True)
+
+    def _on_hover(self, entering):
+        if not self._selected:
+            color = C["surface_3"] if entering else C["surface_2"]
+            self.configure(fg_color=color)
+            self.dot.configure(bg=color)
+
+    def set_selected(self, selected):
+        self._selected = selected
+        if selected:
+            self.configure(fg_color=C["surface_3"], border_color=C["accent"])
+            self.dot.configure(bg=C["surface_3"])
+            self.label.configure(text_color=C["text"])
         else:
-            self.combo_presets = ctk.CTkOptionMenu(self.tabview.tab(self.tab_2_name), variable=self.preset_var, values=self.presets, width=250, height=35,
-                                                   fg_color=btn_color, button_color=btn_color, button_hover_color=btn_hover_color)
-            self.combo_presets.grid(row=1, column=0, pady=10)
-            
-            self.btn_export_preset = ctk.CTkButton(self.tabview.tab(self.tab_2_name), text=self.tr("btn_export"), height=40, font=ctk.CTkFont(size=14, weight="bold"), 
-                                                   fg_color=btn_color, hover_color=btn_hover_color, command=self.export_preset)
-            self.btn_export_preset.grid(row=2, column=0, pady=10)
-        
-        # Status Bar
-        self.status_var = tk.StringVar()
-        self.status_var.set(self.tr("ready"))
-        self.status_bar = ctk.CTkLabel(self.main_frame, textvariable=self.status_var, font=ctk.CTkFont(size=12), text_color="gray")
-        self.status_bar.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="w")
-        
-    def tr(self, key):
-        return TRANSLATIONS[self.lang].get(key, key)
-        
-    def update_ui_text(self):
-        self.title(self.tr("title"))
-        self.title_lbl.configure(text=self.tr("title"))
-        self.lbl_custom.configure(text=self.tr("custom_desc"))
-        self.btn_convert.configure(text=self.tr("btn_select"))
-        self.lbl_preset.configure(text=self.tr("preset_desc"))
-        self.lbl_preview_title.configure(text=self.tr("preview_title"))
-        self.lbl_before.configure(text=self.tr("before"))
-        self.lbl_after.configure(text=self.tr("after"))
-        
-        if hasattr(self, 'btn_export_preset'):
-            self.btn_export_preset.configure(text=self.tr("btn_export"))
-        if hasattr(self, 'lbl_no_presets'):
-            self.lbl_no_presets.configure(text=self.tr("no_presets"))
-            
-        if self.status_var.get() in [TRANSLATIONS["en"]["ready"], TRANSLATIONS["zh"]["ready"]]:
-            self.status_var.set(self.tr("ready"))
+            self.configure(fg_color=C["surface_2"], border_color=C["border"])
+            self.dot.configure(bg=C["surface_2"])
+            self.label.configure(text_color=C["text_sec"])
 
-    def change_language(self, choice):
-        self.lang = "zh" if choice == "中文" else "en"
-        self.update_ui_text()
-        
-    def change_theme(self, choice):
-        ctk.set_appearance_mode(choice)
+    def _update_theme(self, C_):
+        self.configure(fg_color=C_["surface_2"], border_color=C_["border"])
+        self.dot.configure(bg=C_["surface_2"])
+        self.label.configure(text_color=C_["text_sec"])
+        # Redraw the dot
+        self.dot.delete("all")
+        fill = C_["accent"] if self._dot_is_cube else C_["accent_2"]
+        self.dot.create_oval(0, 0, 8, 8, fill=fill, outline="")
+        if self._selected:
+            self.configure(fg_color=C_["surface_3"], border_color=C_["accent"])
+            self.dot.configure(bg=C_["surface_3"])
+            self.label.configure(text_color=C_["text"])
 
-    def draw_color_patches(self):
-        self.canvas_before.delete('all')
+
+class DropZone(ctk.CTkFrame):
+    """Premium drag-and-drop zone with visual feedback."""
+    def __init__(self, parent, on_click=None, **kwargs):
+        super().__init__(
+            parent,
+            fg_color=C["drop_bg"],
+            border_width=2,
+            border_color=C["drop_border"],
+            corner_radius=14,
+            **kwargs,
+        )
+        self.on_click_cb = on_click
+
+        # Icon area (drawn with Canvas)
+        self.icon_canvas = tk.Canvas(
+            self, width=64, height=64,
+            bg=C["drop_bg"], highlightthickness=0,
+        )
+        self.icon_canvas.pack(pady=(30, 8))
+        self._draw_icon()
+
+        # Title
+        self.title_lbl = ctk.CTkLabel(
+            self, text="", font=font(17, "bold"),
+            text_color=C["text"],
+        )
+        self.title_lbl.pack()
+
+        # Subtitle
+        self.sub_lbl = ctk.CTkLabel(
+            self, text="", font=font(12),
+            text_color=C["text_muted"],
+        )
+        self.sub_lbl.pack(pady=(4, 10))
+
+        # Browse button
+        self.browse_btn = ctk.CTkButton(
+            self, text="", height=34, width=140,
+            font=font(12, "bold"),
+            fg_color=C["surface_3"],
+            hover_color=C["border_act"],
+            border_width=1,
+            border_color=C["border"],
+            corner_radius=8,
+            text_color=C["text"],
+            command=self._on_browse,
+        )
+        self.browse_btn.pack(pady=(0, 30))
+
+        # Bind click on the zone itself
+        self.bind("<Button-1>", lambda e: self._on_browse())
+        self.title_lbl.bind("<Button-1>", lambda e: self._on_browse())
+        self.sub_lbl.bind("<Button-1>", lambda e: self._on_browse())
+
+    def _draw_icon(self):
+        """Draw a simple upload arrow icon."""
+        c = self.icon_canvas
+        c.delete("all")
+        # Arrow body
+        c.create_line(32, 48, 32, 16, fill=C["text_muted"], width=3, capstyle="round")
+        # Arrow head
+        c.create_line(32, 16, 22, 28, fill=C["text_muted"], width=3, capstyle="round")
+        c.create_line(32, 16, 42, 28, fill=C["text_muted"], width=3, capstyle="round")
+        # Bottom tray
+        c.create_line(14, 48, 50, 48, fill=C["text_muted"], width=3, capstyle="round")
+
+    def _on_browse(self):
+        if self.on_click_cb:
+            self.on_click_cb()
+
+    def set_hover(self, active):
+        if active:
+            self.configure(border_color=C["accent"])
+            self.icon_canvas.configure(bg=C["drop_bg"])
+            self.icon_canvas.delete("all")
+            c = self.icon_canvas
+            c.create_line(32, 48, 32, 16, fill=C["accent"], width=3, capstyle="round")
+            c.create_line(32, 16, 22, 28, fill=C["accent"], width=3, capstyle="round")
+            c.create_line(32, 16, 42, 28, fill=C["accent"], width=3, capstyle="round")
+            c.create_line(14, 48, 50, 48, fill=C["accent"], width=3, capstyle="round")
+        else:
+            self.configure(border_color=C["drop_border"])
+            self._draw_icon()
+
+    def _update_theme(self, C_):
+        self.configure(fg_color=C_["drop_bg"], border_color=C_["drop_border"])
+        self.title_lbl.configure(text_color=C_["text"])
+        self.sub_lbl.configure(text_color=C_["text_muted"])
+        self.icon_canvas.configure(bg=C_["drop_bg"])
+        self.browse_btn.configure(
+            fg_color=C_["surface_3"],
+            hover_color=C_["border_act"],
+            border_color=C_["border"],
+            text_color=C_["text"],
+        )
+        self._draw_icon()
+
+
+class ColorPreview(ctk.CTkFrame):
+    """Color patch comparison: original vs LUT-applied."""
+    def __init__(self, parent, **kwargs):
+        super().__init__(
+            parent,
+            fg_color=C["surface_1"],
+            border_width=1,
+            border_color=C["border"],
+            corner_radius=10,
+            **kwargs,
+        )
+
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        # Header
+        self.header = ctk.CTkLabel(
+            self, text="", font=font(12, "bold"),
+            text_color=C["text"],
+        )
+        self.header.grid(row=0, column=0, columnspan=2, pady=(14, 4), sticky="w", padx=16)
+
+        self.lbl_before = ctk.CTkLabel(
+            self, text="", font=font(10),
+            text_color=C["text_muted"],
+        )
+        self.lbl_before.grid(row=1, column=0, pady=(0, 4))
+
+        self.lbl_after = ctk.CTkLabel(
+            self, text="", font=font(10),
+            text_color=C["text_muted"],
+        )
+        self.lbl_after.grid(row=1, column=1, pady=(0, 4))
+
+        self.canvas_before = tk.Canvas(
+            self, width=180, height=110,
+            bg=C["surface_2"], highlightthickness=1,
+            highlightbackground=C["border"],
+        )
+        self.canvas_before.grid(row=2, column=0, padx=(16, 8), pady=(0, 16))
+
+        self.canvas_after = tk.Canvas(
+            self, width=180, height=110,
+            bg=C["surface_2"], highlightthickness=1,
+            highlightbackground=C["border"],
+        )
+        self.canvas_after.grid(row=2, column=1, padx=(8, 16), pady=(0, 16))
+
+        self._draw_default()
+
+    def _draw_default(self):
         colors = [
-            ('#FF0000', 10, 10),
-            ('#00FF00', 60, 10),
-            ('#0000FF', 110, 10),
-            ('#FFFF00', 10, 60),
-            ('#FF00FF', 60, 60),
-            ('#00FFFF', 110, 60),
+            ('#FF3B30', 15, 10), ('#34C759', 95, 10), ('#007AFF', 15, 60),
+            ('#FFCC00', 95, 60), ('#AF52DE', 55, 10), ('#FF9500', 55, 60),
         ]
-        for color, x, y in colors:
-            self.canvas_before.create_rectangle(x, y, x+40, y+40, fill=color, outline='')
-        self.canvas_after.delete('all')
-        for color, x, y in colors:
-            self.canvas_after.create_rectangle(x, y, x+40, y+40, fill=color, outline='')
+        for canvas in [self.canvas_before, self.canvas_after]:
+            canvas.delete('all')
+            for color, x, y in colors:
+                canvas.create_rectangle(x, y, x + 60, y + 40, fill=color, outline='')
 
-    def apply_lut_to_color(self, r, g, b, samples, size):
+    def update_preview(self, samples, size):
+        """Apply LUT to reference colors and show comparison."""
+        colors = [
+            ((1.0, 0.0, 0.0), 15, 10), ((0.0, 1.0, 0.0), 95, 10),
+            ((0.0, 0.0, 1.0), 15, 60), ((1.0, 1.0, 0.0), 95, 60),
+            ((1.0, 0.0, 1.0), 55, 10), ((0.0, 1.0, 1.0), 55, 60),
+        ]
+        self.canvas_after.delete('all')
+        for (r, g, b), x, y in colors:
+            nr, ng, nb = self._apply_lut(r, g, b, samples, size)
+            hex_color = f'#{int(nr*255):02x}{int(ng*255):02x}{int(nb*255):02x}'
+            self.canvas_after.create_rectangle(x, y, x + 60, y + 40, fill=hex_color, outline='')
+
+    def _apply_lut(self, r, g, b, samples, size):
         r_idx = r * (size - 1)
         g_idx = g * (size - 1)
         b_idx = b * (size - 1)
         r0, g0, b0 = int(r_idx), int(g_idx), int(b_idx)
         r1, g1, b1 = min(r0 + 1, size - 1), min(g0 + 1, size - 1), min(b0 + 1, size - 1)
         fr, fg, fb = r_idx - r0, g_idx - g0, b_idx - b0
-        
-        def get_sample(ri, gi, bi):
+
+        def sample(ri, gi, bi):
             idx = ri + gi * size + bi * size * size
-            if idx < len(samples):
-                return samples[idx]
-            return (0.0, 0.0, 0.0)
-        
-        c000 = get_sample(r0, g0, b0)
-        c100 = get_sample(r1, g0, b0)
-        c010 = get_sample(r0, g1, b0)
-        c110 = get_sample(r1, g1, b0)
-        c001 = get_sample(r0, g0, b1)
-        c101 = get_sample(r1, g0, b1)
-        c011 = get_sample(r0, g1, b1)
-        c111 = get_sample(r1, g1, b1)
-        
+            return samples[idx] if idx < len(samples) else (0.0, 0.0, 0.0)
+
+        c000, c100 = sample(r0, g0, b0), sample(r1, g0, b0)
+        c010, c110 = sample(r0, g1, b0), sample(r1, g1, b0)
+        c001, c101 = sample(r0, g0, b1), sample(r1, g0, b1)
+        c011, c111 = sample(r0, g1, b1), sample(r1, g1, b1)
+
         result = []
         for ch in range(3):
             val = (c000[ch] * (1-fr) * (1-fg) * (1-fb) +
@@ -584,153 +784,850 @@ class App(ctk.CTk, TkinterDnD.Tk):
                    c011[ch] * (1-fr) * fg * fb +
                    c111[ch] * fr * fg * fb)
             result.append(max(0.0, min(1.0, val)))
-        return result
+        return tuple(result)
 
-    def update_preview(self, samples, size):
-        colors = [
-            ((1.0, 0.0, 0.0), 10, 10),
-            ((0.0, 1.0, 0.0), 60, 10),
-            ((0.0, 0.0, 1.0), 110, 10),
-            ((1.0, 1.0, 0.0), 10, 60),
-            ((1.0, 0.0, 1.0), 60, 60),
-            ((0.0, 1.0, 1.0), 110, 60),
+    def _update_theme(self, C_):
+        self.configure(fg_color=C_["surface_1"], border_color=C_["border"])
+        self.header.configure(text_color=C_["text"])
+        self.lbl_before.configure(text_color=C_["text_muted"])
+        self.lbl_after.configure(text_color=C_["text_muted"])
+        for c in [self.canvas_before, self.canvas_after]:
+            c.configure(bg=C_["surface_2"], highlightbackground=C_["border"])
+
+
+class HistoryItem(ctk.CTkFrame):
+    """Single entry in the conversion history queue."""
+    def __init__(self, parent, filename, direction, status, timestamp, **kwargs):
+        super().__init__(
+            parent,
+            fg_color=C["surface_2"],
+            border_width=1,
+            border_color=C["border"],
+            corner_radius=6,
+            height=32,
+            **kwargs,
+        )
+        self._status_ok = (status == "ok")
+        self._is_cube_dir = ("CUBE" in direction)
+
+        # Status dot
+        dot_fill = C["success"] if self._status_ok else C["error"]
+        self._dot = tk.Canvas(self, width=8, height=8, bg=C["surface_2"], highlightthickness=0)
+        self._dot.create_oval(0, 0, 8, 8, fill=dot_fill, outline="")
+        self._dot.pack(side="left", padx=(10, 8))
+
+        # Filename
+        ctk.CTkLabel(
+            self, text=filename[:28], font=font(11),
+            text_color=C["text_sec"], anchor="w",
+        ).pack(side="left")
+
+        # Direction badge
+        badge_fill = C["accent"] if self._is_cube_dir else C["accent_2"]
+        ctk.CTkLabel(
+            self, text=direction, font=font(9, "bold"),
+            text_color=badge_fill,
+        ).pack(side="left", padx=(8, 0))
+
+        # Timestamp (right-aligned)
+        ctk.CTkLabel(
+            self, text=timestamp, font=font(9),
+            text_color=C["text_muted"],
+        ).pack(side="right", padx=(0, 10))
+
+    def _update_theme(self, C_):
+        self.configure(fg_color=C_["surface_2"], border_color=C_["border"])
+        # Redraw status dot
+        self._dot.configure(bg=C_["surface_2"])
+        self._dot.delete("all")
+        fill = C_["success"] if self._status_ok else C_["error"]
+        self._dot.create_oval(0, 0, 8, 8, fill=fill, outline="")
+        # Update labels
+        for child in self.winfo_children():
+            if isinstance(child, ctk.CTkLabel):
+                txt = child.cget("text")
+                if txt and ("CUBE" in txt or "XMP" in txt):
+                    child.configure(text_color=C_["accent"] if "CUBE" in txt else C_["accent_2"])
+                elif txt and ":" in txt:
+                    child.configure(text_color=C_["text_muted"])
+                else:
+                    child.configure(text_color=C_["text_sec"])
+
+
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+
+class App(ctk.CTk, TkinterDnD.Tk):
+    def __init__(self):
+        super().__init__()
+
+        # --- State ---
+        self.lang = "zh"
+        self._theme = "dark"
+        self.current_file = None
+        self.current_lut = None  # (title, size, samples)
+        self._header_icon = None  # loaded icon image for header
+        self.history = []
+        self.preset_items = []
+
+        # --- Window (native) ---
+        self.title("CUBE to XMP")
+        self.geometry("1200x780")
+        self.minsize(960, 640)
+        self.configure(fg_color=C["bg"])
+
+        # Set icon
+        icon_path = os.path.join(BASE_PATH, "icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.iconbitmap(icon_path)
+            except Exception:
+                pass
+
+        # --- Drag & Drop ---
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self._on_drop)
+        except Exception:
+            pass
+
+        # --- Grid ---
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # ============================================================
+        # HEADER BAR
+        # ============================================================
+        self.topbar = ctk.CTkFrame(
+            self, fg_color=C["surface_0"], corner_radius=0, height=44,
+        )
+        self.topbar.grid(row=0, column=0, sticky="ew")
+        self.topbar.grid_propagate(False)
+
+        # Logo + app name
+        self.logo_frame = ctk.CTkFrame(self.topbar, fg_color="transparent")
+        self.logo_frame.pack(side="left", padx=(16, 0), pady=3)
+
+        # Load icon for header display
+        icon_path = os.path.join(BASE_PATH, "icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                from PIL import Image
+                img = Image.open(icon_path)
+                # Pick the best size from the ICO
+                img = img.resize((28, 28), Image.LANCZOS)
+                self._header_icon = ctk.CTkImage(light_image=img, dark_image=img, size=(28, 28))
+                icon_lbl = ctk.CTkLabel(self.logo_frame, image=self._header_icon, text="")
+                icon_lbl.pack(side="left", padx=(0, 10))
+            except Exception:
+                # Fallback to green dot
+                dot = tk.Canvas(self.logo_frame, width=10, height=10, bg=C["surface_0"], highlightthickness=0)
+                dot.create_oval(0, 0, 10, 10, fill=C["accent"], outline="")
+                dot.pack(side="left", padx=(0, 10))
+        else:
+            # Fallback to green dot
+            dot = tk.Canvas(self.logo_frame, width=10, height=10, bg=C["surface_0"], highlightthickness=0)
+            dot.create_oval(0, 0, 10, 10, fill=C["accent"], outline="")
+            dot.pack(side="left", padx=(0, 10))
+
+        self.subtitle_lbl = ctk.CTkLabel(
+            self.logo_frame, text="",
+            font=font(12), text_color=C["text_muted"],
+        )
+        self.subtitle_lbl.pack(side="left")
+
+        # Theme + language buttons
+        top_right = ctk.CTkFrame(self.topbar, fg_color="transparent")
+        top_right.pack(side="right", padx=(0, 12), pady=5)
+
+        self.theme_btn = ctk.CTkButton(
+            top_right, text="\u263E", width=28, height=28,
+            font=font(14),
+            fg_color=C["surface_2"], hover_color=C["surface_3"],
+            border_width=1, border_color=C["border"],
+            corner_radius=6, text_color=C["text_sec"],
+            command=self._toggle_theme,
+        )
+        self.theme_btn.pack(side="left", padx=(0, 6))
+
+        self.lang_btn = ctk.CTkButton(
+            top_right, text="EN", width=40, height=28,
+            font=font(11, "bold"),
+            fg_color=C["surface_2"], hover_color=C["surface_3"],
+            border_width=1, border_color=C["border"],
+            corner_radius=6, text_color=C["text_sec"],
+            command=self._toggle_language,
+        )
+        self.lang_btn.pack(side="left")
+
+        # ============================================================
+        # MAIN CONTENT — 3 columns
+        # ============================================================
+        self.main = ctk.CTkFrame(self, fg_color="transparent")
+        self.main.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.main.grid_columnconfigure(0, weight=0, minsize=240)   # Left
+        self.main.grid_columnconfigure(1, weight=1)                 # Center
+        self.main.grid_columnconfigure(2, weight=0, minsize=260)   # Right
+        self.main.grid_rowconfigure(0, weight=1)
+        self.main.grid_rowconfigure(1, weight=0, minsize=140)      # Bottom queue
+
+        # ---- LEFT PANEL ----
+        self._build_left_panel()
+
+        # ---- CENTER PANEL ----
+        self._build_center_panel()
+
+        # ---- RIGHT PANEL ----
+        self._build_right_panel()
+
+        # ---- BOTTOM QUEUE ----
+        self._build_bottom_queue()
+
+        # ============================================================
+        # STATUS BAR
+        # ============================================================
+        self.statusbar = ctk.CTkFrame(
+            self, fg_color=C["surface_0"], corner_radius=0, height=32,
+        )
+        self.statusbar.grid(row=2, column=0, sticky="ew")
+        self.statusbar.grid_propagate(False)
+
+        self.status_lbl = ctk.CTkLabel(
+            self.statusbar, text="",
+            font=font(11), text_color=C["text_muted"],        )
+        self.status_lbl.pack(side="left", padx=14, pady=5)
+
+        # --- Final setup ---
+        self._refresh_texts()
+        self.set_status("ready")
+
+    # ============================================================
+    # BUILD LEFT PANEL
+    # ============================================================
+    def _build_left_panel(self):
+        self.left_panel = ctk.CTkFrame(
+            self.main, fg_color=C["surface_0"], corner_radius=10,
+        )
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(6, 3), rowspan=2)
+
+        # Presets section
+        self.presets_header = SectionHeader(self.left_panel, text="")
+        self.presets_header.pack(fill="x", padx=14, pady=(16, 8))
+        self.presets_container = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        self.presets_container.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+
+        self._load_presets()
+
+        # Recent section
+        self.recent_header = SectionHeader(self.left_panel, text="")
+        self.recent_header.pack(fill="x", padx=14, pady=(12, 8))
+        self.recent_container = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        self.recent_container.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        self.no_recent_lbl = ctk.CTkLabel(
+            self.recent_container, text="",
+            font=font(11), text_color=C["text_muted"],
+        )
+        self.no_recent_lbl.pack(pady=20)
+
+    def _load_presets(self):
+        built_in_luts_path = os.path.join(BASE_PATH, "built_in_luts")
+        if not os.path.exists(built_in_luts_path):
+            self.no_presets_lbl = ctk.CTkLabel(
+                self.presets_container, text="",
+                font=font(11), text_color=C["text_muted"],
+            )
+            self.no_presets_lbl.pack(pady=20)
+            return
+
+        files = sorted([f for f in os.listdir(built_in_luts_path) if f.endswith(('.cube', '.xmp'))])
+        if not files:
+            self.no_presets_lbl = ctk.CTkLabel(
+                self.presets_container, text="",
+                font=font(11), text_color=C["text_muted"],
+            )
+            self.no_presets_lbl.pack(pady=20)
+            return
+
+        self.preset_items = []
+        for fname in files:
+            path = os.path.join(built_in_luts_path, fname)
+            item = PresetItem(
+                self.presets_container, fname, path,
+                on_click=self._on_preset_click,
+            )
+            item.pack(fill="x", pady=2)
+            self.preset_items.append(item)
+
+    def _on_preset_click(self, file_path):
+        """When a preset is clicked, load it for preview."""
+        for item in self.preset_items:
+            item.set_selected(item.file_path == file_path)
+        self._load_file(file_path)
+
+    # ============================================================
+    # BUILD CENTER PANEL
+    # ============================================================
+    def _build_center_panel(self):
+        self.center_panel = ctk.CTkFrame(
+            self.main, fg_color="transparent",
+        )
+        self.center_panel.grid(row=0, column=1, sticky="nsew", padx=3)
+        self.center_panel.grid_columnconfigure(0, weight=1)
+        self.center_panel.grid_rowconfigure(0, weight=1)
+
+        # Drop zone (shown when no file loaded)
+        self.drop_zone = DropZone(
+            self.center_panel, on_click=self._browse_file,
+        )
+        self.drop_zone.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        # Preview area (shown when file is loaded)
+        self.preview = ColorPreview(self.center_panel)
+
+    # ============================================================
+    # BUILD RIGHT PANEL
+    # ============================================================
+    def _build_right_panel(self):
+        self.right_panel = ctk.CTkFrame(
+            self.main, fg_color=C["surface_0"], corner_radius=10,
+        )
+        self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(3, 6), rowspan=2)
+        self.right_panel.grid_columnconfigure(0, weight=1)
+
+        # LUT Info section
+        self.lut_info_header = SectionHeader(self.right_panel, text="")
+        self.lut_info_header.pack(fill="x", padx=14, pady=(16, 10))
+
+        self.info_frame = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        self.info_frame.pack(fill="x", padx=14)
+        self.info_frame.grid_columnconfigure(1, weight=1)
+
+        info_fields = [
+            ("lut_name", "—"),
+            ("lut_size", "—"),
+            ("lut_type", "—"),
+            ("lut_path", "—"),
         ]
-        self.canvas_after.delete('all')
-        for (r, g, b), x, y in colors:
-            new_r, new_g, new_b = self.apply_lut_to_color(r, g, b, samples, size)
-            hex_color = f'#{int(new_r*255):02x}{int(new_g*255):02x}{int(new_b*255):02x}'
-            self.canvas_after.create_rectangle(x, y, x+40, y+40, fill=hex_color, outline='')
+        self.info_labels = {}
+        for i, (key, default) in enumerate(info_fields):
+            lbl = ctk.CTkLabel(
+                self.info_frame, text="",
+                font=font(11), text_color=C["text_muted"],            )
+            lbl.grid(row=i, column=0, sticky="w", pady=3, padx=(0, 12))
+            val = ctk.CTkLabel(
+                self.info_frame, text=default,
+                font=font(11), text_color=C["text"],
+                anchor="w",
+            )
+            val.grid(row=i, column=1, sticky="ew", pady=3)
+            self.info_labels[key] = val
 
-    def set_status(self, msg_key, **kwargs):
-        msg = self.tr(msg_key)
-        if kwargs:
-            msg = msg.format(**kwargs)
-        self.status_var.set(msg)
-        self.update()
+        # Parameters section
+        self.params_header = SectionHeader(self.right_panel, text="")
+        self.params_header.pack(fill="x", padx=14, pady=(18, 10))
 
-    def handle_drop(self, event):
-        file_path = event.data.strip('{}')
+        self.params_frame = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        self.params_frame.pack(fill="x", padx=14)
+        self.params_frame.grid_columnconfigure(1, weight=1)
+
+        # Group entry
+        ctk.CTkLabel(
+            self.params_frame, text="",
+            font=font(11), text_color=C["text_muted"],        ).grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
+        self.group_entry = ctk.CTkEntry(
+            self.params_frame, height=30,
+            font=font(11), fg_color=C["surface_2"],
+            border_color=C["border"], corner_radius=6,
+            text_color=C["text"],
+        )
+        self.group_entry.grid(row=0, column=1, sticky="ew", pady=3)
+        self.group_entry.insert(0, "Profiles")
+
+        # Description entry
+        ctk.CTkLabel(
+            self.params_frame, text="",
+            font=font(11), text_color=C["text_muted"],        ).grid(row=1, column=0, sticky="w", pady=3, padx=(0, 12))
+        self.desc_entry = ctk.CTkEntry(
+            self.params_frame, height=30,
+            font=font(11), fg_color=C["surface_2"],
+            border_color=C["border"], corner_radius=6,
+            text_color=C["text"],
+        )
+        self.desc_entry.grid(row=1, column=1, sticky="ew", pady=3)
+
+        # Export button
+        self.export_btn = ctk.CTkButton(
+            self.right_panel, text="", height=40,
+            font=font(13, "bold"),
+            fg_color=C["accent"], hover_color=C["accent_dim"],
+            corner_radius=8, text_color="#FFFFFF",
+            command=self._export,
+        )
+        self.export_btn.pack(fill="x", padx=14, pady=(20, 16))
+
+        # Disable export initially
+        self.export_btn.configure(state="disabled", fg_color=C["surface_2"], text_color=C["text_muted"])
+
+    # ============================================================
+    # BUILD BOTTOM QUEUE
+    # ============================================================
+    def _build_bottom_queue(self):
+        self.queue_frame = ctk.CTkFrame(
+            self.main, fg_color=C["surface_0"], corner_radius=10,
+        )
+        self.queue_frame.grid(row=1, column=1, sticky="nsew", padx=3, pady=(4, 0))
+
+        # Header row
+        header_row = ctk.CTkFrame(self.queue_frame, fg_color="transparent")
+        header_row.pack(fill="x", padx=14, pady=(10, 4))
+
+        self.history_header = SectionHeader(header_row, text="")
+        self.history_header.pack(side="left")
+
+        self.clear_btn = ctk.CTkButton(
+            header_row, text="", width=70, height=22,
+            font=font(9), fg_color=C["surface_2"],
+            hover_color=C["surface_3"], border_width=1,
+            border_color=C["border"], corner_radius=5,
+            text_color=C["text_muted"], command=self._clear_history,
+        )
+        self.clear_btn.pack(side="right")
+
+        # Scrollable history
+        self.history_scroll = ctk.CTkScrollableFrame(
+            self.queue_frame, fg_color=C["surface_0"],
+        )
+        self.history_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        self.no_history_lbl = ctk.CTkLabel(
+            self.history_scroll, text="",
+            font=font(11), text_color=C["text_muted"],
+        )
+        self.no_history_lbl.pack(pady=20)
+
+    # ============================================================
+    # TEXT / I18N
+    # ============================================================
+    def tr(self, key):
+        return T[self.lang].get(key, key)
+
+    def _toggle_language(self):
+        self.lang = "en" if self.lang == "zh" else "zh"
+        self.lang_btn.configure(text="EN" if self.lang == "zh" else "中文")
+        self._refresh_texts()
+
+    def _toggle_theme(self):
+        """Toggle between dark and light themes."""
+        global C
+        if self._theme == "dark":
+            self._theme = "light"
+            C.update(C_LIGHT)
+            ctk.set_appearance_mode("Light")
+            self.theme_btn.configure(text="\u263C")
+            self.theme_btn.configure(text_color=C["text_sec"])
+        else:
+            self._theme = "dark"
+            C.update(C_DARK)
+            ctk.set_appearance_mode("Dark")
+            self.theme_btn.configure(text="\u263E")
+            self.theme_btn.configure(text_color=C["text_sec"])
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """Recolour all custom widgets after theme switch."""
+        C_ = C
+
+        # --- Header ---
+        self.configure(fg_color=C_["bg"])
+        self.topbar.configure(fg_color=C_["surface_0"])
+        if hasattr(self, 'topbar'):
+            self.topbar.configure(border_color=C_["border"])
+
+        # --- Logo dot canvas ---
+        for child in self.logo_frame.winfo_children():
+            if isinstance(child, tk.Canvas):
+                child.configure(bg=C_["surface_0"])
+                child.delete("all")
+                child.create_oval(0, 0, 10, 10, fill=C_["accent"], outline="")
+
+        # --- Subtitle label ---
+        self.subtitle_lbl.configure(text_color=C_["text_muted"])
+
+        # --- Header buttons ---
+        for btn in [self.theme_btn, self.lang_btn]:
+            btn.configure(
+                fg_color=C_["surface_2"],
+                hover_color=C_["surface_3"],
+                border_color=C_["border"],
+                text_color=C_["text_sec"],
+            )
+
+        # --- Drop zone ---
+        self.drop_zone._update_theme(C_)
+
+        # --- Preview ---
+        if hasattr(self, 'preview'):
+            self.preview._update_theme(C_)
+
+        # --- Left panel ---
+        self.left_panel.configure(fg_color=C_["surface_0"])
+        # Section headers
+        for child in self.left_panel.winfo_children():
+            if isinstance(child, SectionHeader):
+                child.configure(text_color=C_["text_sec"])
+            elif isinstance(child, ctk.CTkFrame):
+                child.configure(fg_color="transparent")
+
+        # Preset items (inside containers)
+        for container in [getattr(self, 'presets_container', None), getattr(self, 'recent_container', None)]:
+            if container is None:
+                continue
+            container.configure(fg_color="transparent")
+            for child in container.winfo_children():
+                if isinstance(child, PresetItem):
+                    child._update_theme(C_)
+                elif isinstance(child, ctk.CTkLabel):
+                    child.configure(text_color=C_["text_muted"])
+
+        # No-presets / no-recent labels
+        for attr in ['no_presets_lbl', 'no_recent_lbl']:
+            if hasattr(self, attr) and getattr(self, attr).winfo_exists():
+                getattr(self, attr).configure(text_color=C_["text_muted"])
+
+        # --- Right panel ---
+        self.right_panel.configure(fg_color=C_["surface_0"])
+        for child in self.right_panel.winfo_children():
+            if isinstance(child, SectionHeader):
+                child.configure(text_color=C_["text_sec"])
+            elif isinstance(child, Card):
+                child._update_theme(C_)
+            elif isinstance(child, ctk.CTkFrame):
+                child.configure(fg_color="transparent")
+            elif isinstance(child, ctk.CTkButton):
+                child.configure(
+                    fg_color=C_["surface_2"],
+                    hover_color=C_["surface_3"],
+                    border_color=C_["border"],
+                    text_color=C_["text_sec"],
+                )
+
+        # Right panel info/param labels (inside info_frame, params_frame)
+        for frame_attr in ['info_frame', 'params_frame']:
+            frame = getattr(self, frame_attr, None)
+            if frame is None:
+                continue
+            for child in frame.winfo_children():
+                if isinstance(child, ctk.CTkLabel):
+                    child.configure(text_color=C_["text_muted"])
+                elif isinstance(child, ctk.CTkEntry):
+                    child.configure(
+                        fg_color=C_["surface_2"],
+                        border_color=C_["border"],
+                        text_color=C_["text"],
+                    )
+
+        # --- Bottom history ---
+        self.queue_frame.configure(fg_color=C_["surface_0"])
+        if hasattr(self, 'history_scroll'):
+            self.history_scroll.configure(fg_color=C_["surface_0"])
+            for child in self.history_scroll.winfo_children():
+                if isinstance(child, HistoryItem):
+                    child._update_theme(C_)
+                elif isinstance(child, ctk.CTkLabel):
+                    child.configure(text_color=C_["text_muted"])
+
+        # --- Export button ---
+        if self.current_file:
+            self.export_btn.configure(
+                fg_color=C_["accent"],
+                hover_color=C_["accent_dim"],
+                text_color="#FFFFFF",
+            )
+        else:
+            self.export_btn.configure(
+                fg_color=C_["surface_2"],
+                hover_color=C_["surface_3"],
+                border_color=C_["border"],
+                text_color=C_["text_muted"],
+            )
+
+        # --- History header ---
+        if hasattr(self, 'history_header'):
+            self.history_header.configure(text_color=C_["text_sec"])
+        if hasattr(self, 'clear_btn'):
+            self.clear_btn.configure(
+                fg_color=C_["surface_2"],
+                hover_color=C_["surface_3"],
+                border_color=C_["border"],
+                text_color=C_["text_muted"],
+            )
+        if hasattr(self, 'no_history_lbl'):
+            self.no_history_lbl.configure(text_color=C_["text_muted"])
+        if hasattr(self, 'no_recent_lbl'):
+            self.no_recent_lbl.configure(text_color=C_["text_muted"])
+
+        # --- Status bar ---
+        if hasattr(self, 'statusbar'):
+            self.statusbar.configure(fg_color=C_["surface_0"], border_color=C_["border"])
+        if hasattr(self, 'status_lbl'):
+            self.status_lbl.configure(text_color=C_["text_muted"])
+
+        # --- Center frame ---
+        if hasattr(self, 'center_panel'):
+            self.center_panel.configure(fg_color="transparent")
+        if hasattr(self, 'main'):
+            self.main.configure(fg_color="transparent")
+
+        # Force flush — ensures all widgets render with new colors immediately
+        self.update_idletasks()
+
+    def _refresh_texts(self):
+        """Refresh all UI text to current language."""
+        self.subtitle_lbl.configure(text=self.tr("subtitle"))
+        self._update_section_headers()
+
+        # Drop zone
+        self.drop_zone.title_lbl.configure(text=self.tr("drop_title"))
+        self.drop_zone.sub_lbl.configure(text=self.tr("drop_sub"))
+        self.drop_zone.browse_btn.configure(text=self.tr("btn_browse"))
+
+        # Preview
+        self.preview.header.configure(text=self.tr("preview"))
+        self.preview.lbl_before.configure(text=self.tr("before"))
+        self.preview.lbl_after.configure(text=self.tr("after"))
+
+        # History
+        self.history_header.configure(text=self.tr("history").upper())
+        self.clear_btn.configure(text=self.tr("action_clear"))
+        self.no_history_lbl.configure(text=self.tr("no_recent"))
+        self.no_recent_lbl.configure(text=self.tr("no_recent"))
+
+        # Export button
+        self._update_export_button_text()
+
+    def _update_section_headers(self):
+        """Update all section header and label texts."""
+        self.presets_header.configure(text=self.tr("presets").upper())
+        self.recent_header.configure(text=self.tr("recent").upper())
+        self.lut_info_header.configure(text=self.tr("lut_info").upper())
+        self.params_header.configure(text=self.tr("params").upper())
+
+        # Param labels
+        param_labels = list(self.params_frame.winfo_children())
+        if len(param_labels) >= 4:
+            param_labels[0].configure(text=self.tr("param_group"))
+            param_labels[2].configure(text=self.tr("param_desc"))
+
+        # Info labels
+        info_widgets = list(self.info_frame.winfo_children())
+        for key, idx in [("lut_name", 0), ("lut_size", 2), ("lut_type", 4), ("lut_path", 6)]:
+            if idx < len(info_widgets):
+                info_widgets[idx].configure(text=self.tr(key))
+
+        # No presets label
+        if hasattr(self, 'no_presets_lbl') and self.no_presets_lbl.winfo_exists():
+            self.no_presets_lbl.configure(text=self.tr("no_presets"))
+
+    def _update_export_button_text(self):
+        if self.current_file:
+            ext = os.path.splitext(self.current_file)[1].lower()
+            if ext == '.cube':
+                self.export_btn.configure(text=self.tr("btn_export_xmp"))
+            else:
+                self.export_btn.configure(text=self.tr("btn_export_cube"))
+        else:
+            self.export_btn.configure(text=self.tr("btn_export"))
+
+    # ============================================================
+    # FILE HANDLING
+    # ============================================================
+    def _on_drop(self, event):
+        file_path = event.data.strip('{}').strip('"')
         if os.path.isfile(file_path):
             ext = os.path.splitext(file_path)[1].lower()
             if ext in ['.cube', '.xmp']:
-                self.set_status("parsing")
-                if ext == '.cube':
-                    self._process_cube_to_xmp(file_path)
-                else:
-                    self._process_xmp_to_cube(file_path)
+                self._load_file(file_path)
             else:
-                messagebox.showerror("Error", "Unsupported file format. Please drop .cube or .xmp file.")
-        else:
-            messagebox.showerror("Error", "Invalid file path.")
+                messagebox.showerror(
+                    "Error" if self.lang == "en" else "错误",
+                    "Unsupported format. Please use .cube or .xmp files."
+                    if self.lang == "en" else "不支持的文件格式，请使用 .cube 或 .xmp 文件。"
+                )
 
-    def convert(self):
-        file_path = filedialog.askopenfilename(filetypes=[("LUT or XMP files", "*.cube *.xmp"), ("CUBE files", "*.cube"), ("XMP files", "*.xmp")])
-        if not file_path:
-            return
+    def _browse_file(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ("LUT files", "*.cube;*.xmp"),
+                ("CUBE files", "*.cube"),
+                ("XMP files", "*.xmp"),
+            ],
+        )
+        if file_path:
+            self._load_file(file_path)
+
+    def _load_file(self, file_path):
+        """Load a .cube or .xmp file and show preview + info."""
+        self.current_file = file_path
         ext = os.path.splitext(file_path)[1].lower()
-        if ext == '.cube':
-            self._process_cube_to_xmp(file_path)
-        elif ext == '.xmp':
-            self._process_xmp_to_cube(file_path)
-        else:
-            messagebox.showerror("Error", "Unsupported file format. Please select .cube or .xmp file.")
-        
-    def export_preset(self):
-        selected = self.preset_var.get()
-        if not selected:
-            messagebox.showwarning("Warning", self.tr("warn_no_preset"))
-            return
-        file_path = os.path.join("built_in_luts", selected)
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == '.cube':
-            self._process_cube_to_xmp(file_path, is_preset=True)
-        elif ext == '.xmp':
-            self._process_xmp_to_cube(file_path)
-        
-    def _process_cube_to_xmp(self, file_path, is_preset=False):
-        self.cancel_event.clear()
-        dialog = ProgressDialog(self, self.tr("processing"), self.tr("parsing"), self.lang)
-        def process():
-            try:
+
+        try:
+            if ext == '.cube':
                 title, size, samples = parse_cube(file_path)
-                if not samples:
-                    raise ValueError("No valid color samples found in CUBE file")
-                if dialog.cancelled:
-                    self.set_status("cancelled")
-                    dialog.close()
-                    return
-                dialog.update_progress(0.3)
-                dialog.update_message(self.tr("building"))
-                self.update_preview(samples, size)
+                self.current_lut = (title, size, samples, "CUBE")
+            else:
+                title, size, samples = parse_xmp(file_path)
+                self.current_lut = (title, size, samples, "XMP")
+
+            # Show preview area, hide drop zone
+            self.drop_zone.grid_remove()
+            self.preview.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+            self.preview.update_preview(samples, size)
+
+            # Update info panel
+            self.info_labels["lut_name"].configure(text=title)
+            self.info_labels["lut_size"].configure(text=f"{size} x {size} x {size}")
+            self.info_labels["lut_type"].configure(
+                text=self.tr("file_cube") if ext == '.cube' else self.tr("file_xmp")
+            )
+            # Truncate path for display
+            display_path = file_path
+            if len(display_path) > 45:
+                display_path = "..." + display_path[-42:]
+            self.info_labels["lut_path"].configure(text=display_path)
+
+            # Enable export
+            self.export_btn.configure(
+                state="normal", fg_color=C["accent"],
+                hover_color=C["accent_dim"], text_color="#FFFFFF",
+            )
+            self._update_export_button_text()
+
+            # Update preset selection
+            for item in self.preset_items:
+                item.set_selected(item.file_path == file_path)
+
+            self.set_status("ready")
+
+        except Exception as e:
+            messagebox.showerror(
+                "Error" if self.lang == "en" else "错误",
+                f"Failed to load file:\n{str(e)}"
+                if self.lang == "en" else f"加载文件失败:\n{str(e)}"
+            )
+            self.set_status("error")
+
+    # ============================================================
+    # EXPORT
+    # ============================================================
+    def _export(self):
+        if not self.current_file or not self.current_lut:
+            return
+
+        title, size, samples, source_type = self.current_lut
+        ext = os.path.splitext(self.current_file)[1].lower()
+
+        self.set_status("processing")
+
+        try:
+            if ext == '.cube':
+                # CUBE → XMP
                 xmp_content = build_xmp(title, size, samples)
-                if dialog.cancelled:
-                    self.set_status("cancelled")
-                    dialog.close()
-                    return
-                dialog.update_progress(0.7)
-                default_name = title.replace(" ", "_") + ".xmp" if is_preset else os.path.basename(file_path).replace(".cube", ".xmp")
-                dialog.update_progress(0.9)
-                dialog.close()
+                default_name = os.path.basename(self.current_file).replace(".cube", ".xmp")
                 out_path = filedialog.asksaveasfilename(
-                    title=self.tr("dialog_save_xmp"),
+                    title=self.tr("btn_export_xmp"),
                     defaultextension=".xmp",
                     filetypes=[("XMP files", "*.xmp")],
-                    initialfile=default_name
+                    initialfile=default_name,
                 )
                 if out_path:
                     with open(out_path, 'w', encoding='utf-8') as f:
                         f.write(xmp_content)
+                    self._add_history(os.path.basename(out_path), "CUBE → XMP", "ok")
                     self.set_status("success", filename=os.path.basename(out_path))
-                    messagebox.showinfo("Success", f"{self.tr('success').format(filename=os.path.basename(out_path))}\n{out_path}")
-                else:
-                    self.set_status("cancelled")
-            except Exception as e:
-                dialog.close()
-                self.set_status("error")
-                messagebox.showerror("Error", f"Failed to convert CUBE to XMP:\n{str(e)}")
-        threading.Thread(target=process, daemon=True).start()
-
-    def _process_xmp_to_cube(self, file_path):
-        self.cancel_event.clear()
-        dialog = ProgressDialog(self, self.tr("processing"), self.tr("parsing"), self.lang)
-        def process():
-            try:
-                title, size, samples = parse_xmp(file_path)
-                if not samples:
-                    raise ValueError("No valid color samples found in XMP file")
-                if dialog.cancelled:
-                    self.set_status("cancelled")
-                    dialog.close()
-                    return
-                dialog.update_progress(0.3)
-                dialog.update_message(self.tr("building"))
-                self.draw_color_patches()
+            else:
+                # XMP → CUBE
                 cube_content = build_cube(title, size, samples)
-                if dialog.cancelled:
-                    self.set_status("cancelled")
-                    dialog.close()
-                    return
-                dialog.update_progress(0.7)
-                dialog.close()
+                default_name = os.path.basename(self.current_file).replace(".xmp", ".cube")
                 out_path = filedialog.asksaveasfilename(
-                    title=self.tr("dialog_save_cube"),
+                    title=self.tr("btn_export_cube"),
                     defaultextension=".cube",
                     filetypes=[("CUBE files", "*.cube")],
-                    initialfile=os.path.basename(file_path).replace(".xmp", ".cube")
+                    initialfile=default_name,
                 )
                 if out_path:
                     with open(out_path, 'w', encoding='utf-8') as f:
                         f.write(cube_content)
+                    self._add_history(os.path.basename(out_path), "XMP → CUBE", "ok")
                     self.set_status("success", filename=os.path.basename(out_path))
-                    messagebox.showinfo("Success", f"{self.tr('success').format(filename=os.path.basename(out_path))}\n{out_path}")
-                else:
-                    self.set_status("cancelled")
-            except Exception as e:
-                dialog.close()
-                self.set_status("error")
-                messagebox.showerror("Error", f"Failed to convert XMP to CUBE:\n{str(e)}")
-        threading.Thread(target=process, daemon=True).start()
 
+            if not out_path:
+                self.set_status("cancelled")
+
+        except Exception as e:
+            self._add_history(os.path.basename(self.current_file), "ERROR", "fail")
+            self.set_status("error")
+            messagebox.showerror(
+                "Error" if self.lang == "en" else "错误",
+                f"Conversion failed:\n{str(e)}"
+                if self.lang == "en" else f"转换失败:\n{str(e)}"
+            )
+
+    # ============================================================
+    # HISTORY
+    # ============================================================
+    def _add_history(self, filename, direction, status):
+        now = datetime.now().strftime("%H:%M:%S")
+        self.history.insert(0, (filename, direction, status, now))
+        if len(self.history) > 50:
+            self.history = self.history[:50]
+        self._refresh_history()
+
+    def _refresh_history(self):
+        # Clear existing
+        for widget in self.history_scroll.winfo_children():
+            widget.destroy()
+
+        if not self.history:
+            self.no_history_lbl = ctk.CTkLabel(
+                self.history_scroll, text=self.tr("no_recent"),
+                font=font(11), text_color=C["text_muted"],
+            )
+            self.no_history_lbl.pack(pady=20)
+            return
+
+        for filename, direction, status, ts in self.history:
+            item = HistoryItem(self.history_scroll, filename, direction, status, ts)
+            item.pack(fill="x", pady=1)
+
+    def _clear_history(self):
+        self.history.clear()
+        self._refresh_history()
+
+    # ============================================================
+    # STATUS BAR
+    # ============================================================
+    def set_status(self, key, **kwargs):
+        msg = self.tr(key)
+        if kwargs:
+            msg = msg.format(**kwargs)
+        self.status_lbl.configure(text=msg)
+
+        # Color the status
+        if key == "success":
+            self.status_lbl.configure(text_color=C["success"])
+        elif key == "error":
+            self.status_lbl.configure(text_color=C["error"])
+        elif key == "processing":
+            self.status_lbl.configure(text_color=C["accent"])
+        else:
+            self.status_lbl.configure(text_color=C["text_muted"])
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 if __name__ == "__main__":
     app = App()
     app.mainloop()
