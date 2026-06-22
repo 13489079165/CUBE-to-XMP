@@ -99,6 +99,9 @@ FONT_FAMILY = "Inter"
 TITLE_FONT_FAMILY = "Montserrat"  # Used for "CUBE to XMP" title
 MONO_FAMILY = "Consolas"
 
+# Common CUBE LUT sizes — industry standard presets
+CUBE_SIZE_PRESETS = [16, 17, 25, 32, 33, 64, 65]
+
 
 def font(size=13, weight="normal", family=None):
     """Create a CTkFont — body text."""
@@ -414,6 +417,7 @@ T = {
         "params": "输出参数",
         "param_group": "分组",
         "param_desc": "描述",
+        "param_cube_size": "导出尺寸",
         "history": "转换历史",
         "ready": "就绪",
         "parsing": "正在解析文件...",
@@ -456,6 +460,7 @@ T = {
         "params": "Output Parameters",
         "param_group": "Group",
         "param_desc": "Description",
+        "param_cube_size": "Output Size",
         "history": "Conversion History",
         "ready": "Ready",
         "parsing": "Parsing file...",
@@ -587,7 +592,7 @@ class PresetItem(ctk.CTkFrame):
 
 class DropZone(ctk.CTkFrame):
     """Premium drag-and-drop zone with visual feedback."""
-    def __init__(self, parent, on_click=None, **kwargs):
+    def __init__(self, parent, on_click=None, on_drop=None, **kwargs):
         super().__init__(
             parent,
             fg_color=C["drop_bg"],
@@ -597,6 +602,17 @@ class DropZone(ctk.CTkFrame):
             **kwargs,
         )
         self.on_click_cb = on_click
+        self.on_drop_cb = on_drop
+
+        # Register this frame as a DND target so files dropped directly
+        # onto the drop zone are handled (not just the parent window).
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self._on_drop)
+            self.dnd_bind('<<DragEnter>>', lambda e: self.set_hover(True))
+            self.dnd_bind('<<DragLeave>>', lambda e: self.set_hover(False))
+        except Exception:
+            pass  # parent window DND will catch it as fallback
 
         # Icon area (drawn with Canvas)
         self.icon_canvas = tk.Canvas(
@@ -654,6 +670,11 @@ class DropZone(ctk.CTkFrame):
     def _on_browse(self):
         if self.on_click_cb:
             self.on_click_cb()
+
+    def _on_drop(self, event):
+        """Forward drop event to the parent callback."""
+        if self.on_drop_cb:
+            self.on_drop_cb(event)
 
     def set_hover(self, active):
         if active:
@@ -886,11 +907,16 @@ class App(ctk.CTk, TkinterDnD.Tk):
                 pass
 
         # --- Drag & Drop ---
+        # CTk.__init__ calls tkinter.Tk.__init__ directly (via CTK_PARENT_CLASS),
+        # which SKIPS TkinterDnD.Tk.__init__ in the MRO. As a result the tkdnd
+        # library is never loaded and DND silently fails. We must call
+        # TkinterDnD._require(self) manually to load it.
         try:
+            self.TkdndVersion = TkinterDnD._require(self)
             self.drop_target_register(DND_FILES)
             self.dnd_bind('<<Drop>>', self._on_drop)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DND] init failed: {e}")
 
         # --- Grid ---
         self.grid_columnconfigure(0, weight=1)
@@ -1079,7 +1105,7 @@ class App(ctk.CTk, TkinterDnD.Tk):
 
         # Drop zone (shown when no file loaded)
         self.drop_zone = DropZone(
-            self.center_panel, on_click=self._browse_file,
+            self.center_panel, on_click=self._browse_file, on_drop=self._on_drop,
         )
         self.drop_zone.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
@@ -1133,9 +1159,11 @@ class App(ctk.CTk, TkinterDnD.Tk):
         self.params_frame.grid_columnconfigure(1, weight=1)
 
         # Group entry
-        ctk.CTkLabel(
+        self.param_group_lbl = ctk.CTkLabel(
             self.params_frame, text="",
-            font=font(11), text_color=C["text_muted"],        ).grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
+            font=font(11), text_color=C["text_muted"],
+        )
+        self.param_group_lbl.grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
         self.group_entry = ctk.CTkEntry(
             self.params_frame, height=30,
             font=font(11), fg_color=C["surface_2"],
@@ -1146,9 +1174,11 @@ class App(ctk.CTk, TkinterDnD.Tk):
         self.group_entry.insert(0, "Profiles")
 
         # Description entry
-        ctk.CTkLabel(
+        self.param_desc_lbl = ctk.CTkLabel(
             self.params_frame, text="",
-            font=font(11), text_color=C["text_muted"],        ).grid(row=1, column=0, sticky="w", pady=3, padx=(0, 12))
+            font=font(11), text_color=C["text_muted"],
+        )
+        self.param_desc_lbl.grid(row=1, column=0, sticky="w", pady=3, padx=(0, 12))
         self.desc_entry = ctk.CTkEntry(
             self.params_frame, height=30,
             font=font(11), fg_color=C["surface_2"],
@@ -1157,6 +1187,28 @@ class App(ctk.CTk, TkinterDnD.Tk):
         )
         self.desc_entry.grid(row=1, column=1, sticky="ew", pady=3)
 
+        # Cube output size selector
+        self.param_size_lbl = ctk.CTkLabel(
+            self.params_frame, text="",
+            font=font(11), text_color=C["text_muted"],
+        )
+        self.param_size_lbl.grid(row=2, column=0, sticky="w", pady=3, padx=(0, 12))
+        self.cube_size_var = tk.StringVar(value="33")
+        self.cube_size_menu = ctk.CTkOptionMenu(
+            self.params_frame,
+            values=[str(s) for s in CUBE_SIZE_PRESETS],
+            variable=self.cube_size_var,
+            height=30, font=font(11),
+            fg_color=C["surface_2"],
+            button_color=C["accent"],
+            button_hover_color=C["accent_dim"],
+            dropdown_fg_color=C["surface_0"],
+            dropdown_text_color=C["text"],
+            dropdown_hover_color=C["surface_3"],
+            text_color=C["text"],
+            corner_radius=6,
+        )
+        self.cube_size_menu.grid(row=2, column=1, sticky="ew", pady=3)
         # Export button
         self.export_btn = ctk.CTkButton(
             self.right_panel, text="", height=40,
@@ -1327,6 +1379,16 @@ class App(ctk.CTk, TkinterDnD.Tk):
                         border_color=C_["border"],
                         text_color=C_["text"],
                     )
+                elif isinstance(child, ctk.CTkOptionMenu):
+                    child.configure(
+                        fg_color=C_["surface_2"],
+                        button_color=C_["accent"],
+                        button_hover_color=C_["accent_dim"],
+                        dropdown_fg_color=C_["surface_0"],
+                        dropdown_text_color=C_["text"],
+                        dropdown_hover_color=C_["surface_3"],
+                        text_color=C_["text"],
+                    )
 
         # --- Bottom history ---
         self.queue_frame.configure(fg_color=C_["surface_0"])
@@ -1415,10 +1477,9 @@ class App(ctk.CTk, TkinterDnD.Tk):
         self.params_header.configure(text=self.tr("params").upper())
 
         # Param labels
-        param_labels = list(self.params_frame.winfo_children())
-        if len(param_labels) >= 4:
-            param_labels[0].configure(text=self.tr("param_group"))
-            param_labels[2].configure(text=self.tr("param_desc"))
+        self.param_group_lbl.configure(text=self.tr("param_group"))
+        self.param_desc_lbl.configure(text=self.tr("param_desc"))
+        self.param_size_lbl.configure(text=self.tr("param_cube_size"))
 
         # Info labels
         info_widgets = list(self.info_frame.winfo_children())
@@ -1444,7 +1505,17 @@ class App(ctk.CTk, TkinterDnD.Tk):
     # FILE HANDLING
     # ============================================================
     def _on_drop(self, event):
-        file_path = event.data.strip('{}').strip('"')
+        # tkdnd delivers paths wrapped in {} (spaces) or bare; handle both.
+        raw = event.data.strip()
+        if raw.startswith('{') and raw.endswith('}'):
+            file_path = raw[1:-1]
+        elif raw.startswith('"') and raw.endswith('"'):
+            file_path = raw[1:-1]
+        else:
+            file_path = raw
+        # If multiple files dropped, take the first one
+        if ' ' in file_path and not os.path.exists(file_path):
+            file_path = file_path.split(' ')[0].strip('{}').strip('"')
         if os.path.isfile(file_path):
             ext = os.path.splitext(file_path)[1].lower()
             if ext in ['.cube', '.xmp']:
@@ -1504,6 +1575,10 @@ class App(ctk.CTk, TkinterDnD.Tk):
             )
             self._update_export_button_text()
 
+            # Set default output size to nearest preset
+            nearest = min(CUBE_SIZE_PRESETS, key=lambda s: abs(s - size))
+            self.cube_size_var.set(str(nearest))
+
             # Update preset selection
             for item in self.preset_items:
                 item.set_selected(item.file_path == file_path)
@@ -1527,13 +1602,20 @@ class App(ctk.CTk, TkinterDnD.Tk):
 
         title, size, samples, source_type = self.current_lut
         ext = os.path.splitext(self.current_file)[1].lower()
+        target_size = int(self.cube_size_var.get())  # user-selected output size
 
         self.set_status("processing")
 
         try:
             if ext == '.cube':
-                # CUBE → XMP
-                xmp_content = build_xmp(title, size, samples)
+                # CUBE → XMP — interpolate to target size if different
+                out_title = f"{title}_{target_size}x{target_size}" if target_size != size else title
+                if target_size != size:
+                    out_samples = interpolate_3d(samples, size, target_size)
+                    out_size = target_size
+                else:
+                    out_samples, out_size = samples, size
+                xmp_content = build_xmp(out_title, out_size, out_samples)
                 default_name = os.path.basename(self.current_file).replace(".cube", ".xmp")
                 out_path = filedialog.asksaveasfilename(
                     title=self.tr("btn_export_xmp"),
@@ -1547,8 +1629,13 @@ class App(ctk.CTk, TkinterDnD.Tk):
                     self._add_history(os.path.basename(out_path), "CUBE → XMP", "ok")
                     self.set_status("success", filename=os.path.basename(out_path))
             else:
-                # XMP → CUBE
-                cube_content = build_cube(title, size, samples)
+                # XMP → CUBE — interpolate to user-selected size
+                if target_size != size:
+                    out_samples = interpolate_3d(samples, size, target_size)
+                    out_size = target_size
+                else:
+                    out_samples, out_size = samples, size
+                cube_content = build_cube(title, out_size, out_samples)
                 default_name = os.path.basename(self.current_file).replace(".xmp", ".cube")
                 out_path = filedialog.asksaveasfilename(
                     title=self.tr("btn_export_cube"),
