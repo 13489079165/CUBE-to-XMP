@@ -129,7 +129,7 @@ Or download the portable version and run `CUBE-to-XMP.exe` directly.
 | 项 | 值 |
 |----|-----|
 | 版本 Version | v2.0 |
-| 作者 Author | 魏浩文 (Claw) |
+| 作者 Author | Owen |
 | 许可 License | MIT |
 | 仓库 Repository | [github.com/13489079165/CUBE-to-XMP](https://github.com/13489079165/CUBE-to-XMP) |
 | 语言 Language | Python 3.10+ |
